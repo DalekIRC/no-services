@@ -21,7 +21,7 @@ In conclusion, the integration of IRC services functions directly within the IRC
 Below is a list of commands which have been implemented so far and any plans regarding the future.
 
 ### REGISTER
-Following the Account Registration IRCv3 specification, you can register an account with the following syntax:
+Following the [Account Registration IRCv3 specification](https://ircv3.net/specs/extensions/account-registration), you can register an account with the following syntax:
 ```
 /REGISTER <account name> <email address> <password>
 ```
