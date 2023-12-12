@@ -10,7 +10,7 @@ module
 				"The module is installed. Now all you need to do is add a loadmodule line:";
 				"loadmodule \"third/no-services\";";
 				"And /REHASH the IRCd.";
-				"The module does not need any other configuration.";
+				"Please see the README that came with this module for configuration documentation.";
 		}
 }
 *** <<<MODULE MANAGER END>>>
