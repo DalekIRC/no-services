@@ -28,6 +28,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs);
 int noservices_configrun(ConfigFile *cf, ConfigEntry *ce, int type);
 
 long CAP_ACCOUNTREGISTRATION = 0L;
+long CAP_SASL_OVR = 0L;
 
 char *construct_url(const char *base_url, const char *extra_params);
 const char *accreg_capability_parameter(Client *client);
@@ -41,9 +42,16 @@ void regkeylist_free(ModData *m);
 const char *regkeylist_serialize(ModData *m);
 void regkeylist_unserialize(const char *str, ModData *m);
 
+
+int sasl_capability_visible(Client *client);
+const char *sasl_capability_parameter(Client *client);
+
 CMD_FUNC(CMD_REGISTER);
 CMD_FUNC(CMD_CREGISTER);
 CMD_FUNC(CMD_LOGIN);
+CMD_OVERRIDE_FUNC(CMD_AUTHENTICATE_OVR);
+
+
 /* Config struct*/
 struct cfgstruct {
 	char *url;
@@ -151,9 +159,23 @@ MOD_INIT()
 	RegisterApiCallbackWebResponse(modinfo->handle, "register_account", register_account);
 	RegisterApiCallbackWebResponse(modinfo->handle, "register_channel", register_channel);
 	RegisterApiCallbackWebResponse(modinfo->handle, "ns_account_login", ns_account_login);
+	CommandOverrideAdd(modinfo->handle, "AUTHENTICATE", 0, CMD_AUTHENTICATE_OVR);
 	CommandAdd(modinfo->handle, "REGISTER", CMD_REGISTER, 3, CMD_USER | CMD_UNREGISTERED);
 	CommandAdd(modinfo->handle, "CREGISTER", CMD_CREGISTER, 3, CMD_USER);
 	CommandAdd(modinfo->handle, "LOGIN", CMD_LOGIN, 3, CMD_USER);
+
+	ClientCapability *clicap = ClientCapabilityFindReal("sasl");
+	ClientCapabilityDel(clicap);
+
+	ClientCapabilityInfo cap;
+	memset(&cap, 0, sizeof(cap));
+	cap.name = "sasl";
+	cap.visible = sasl_capability_visible;
+	cap.parameter = sasl_capability_parameter;
+	ClientCapabilityAdd(modinfo->handle, &cap, &CAP_SASL_OVR);
+
+	moddata_client_set(&me, "saslmechlist", "PLAIN");
+
 	return MOD_SUCCESS;
 }
 
@@ -225,7 +247,7 @@ void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response
 	{
 		if (!strcasecmp(key, "uid"))
 		{
-			client = find_user(json_string_value(value), NULL);
+			client = find_client(json_string_value(value), NULL);
 		}
 		else if (!strcasecmp(key, "success") || !strcasecmp(key, "error"))
 		{
@@ -354,7 +376,7 @@ void register_channel(OutgoingWebRequest *request, OutgoingWebResponse *response
 	{
 		if (!strcasecmp(key, "uid"))
 		{
-			client = find_user(json_string_value(value), NULL);
+			client = find_client(json_string_value(value), NULL);
 		}
 		else if (!strcasecmp(key, "success") || !strcasecmp(key, "error"))
 		{
@@ -387,8 +409,7 @@ void register_channel(OutgoingWebRequest *request, OutgoingWebResponse *response
 			mode_args[1] = client->name;
 			mode_args[2] = 0;
 
-			Client *us = find_client(me.name, NULL); // make this ACTUALLY sent by the server for the mode_is_ok check
-			do_mode(chan, us, NULL, 3, mode_args, 0, 0);
+			do_mode(chan, &me, NULL, 3, mode_args, 0, 0);// make this ACTUALLY sent by the server for the mode_is_ok check
 			sendto_one(client, NULL, "CREGISTER SUCCESS %s :Channel %s has been registered to your account", chan->name, client->user->account);
 			unreal_log(ULOG_INFO, "chanreg", "CHANNEL_REGISTRATION", NULL,
 				   "New channel: \"$chan\" registered to account \"$account\"",
@@ -498,7 +519,7 @@ void regkeylist_unserialize(const char *str, ModData *m)
 
 const char *accreg_capability_parameter(Client *client)
 {
-		return moddata_client_get(&me, "regkeylist"); /* NOTE: could still return NULL */
+	return moddata_client_get(&me, "regkeylist");
 }
 
 
@@ -757,7 +778,7 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 	{
 		if (!strcasecmp(key, "uid"))
 		{
-			client = find_user(json_string_value(value), NULL);
+			client = find_client(json_string_value(value), NULL);
 		}
 		else if (!strcasecmp(key, "success") || !strcasecmp(key, "error"))
 		{
@@ -776,6 +797,7 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 			account = strdup(json_string_value(value));
 		}
 	}
+
 	if (client) // if our client is still online and our channel still exists and they're in it
 	{
 		// yay they registered
@@ -789,15 +811,20 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 				   "$client successfully logged into account $account",
 				   log_data_string("account", client->user->account),
 				   log_data_string("client", client->name ? client->name : "A pre-connected user"));
-			
+			if (HasCapability(client, "sasl"))
+				sendto_one(client, NULL, ":%s 903 %s :SASL authentication successful", me.name, account);
 		}
 		else if (!success && code && account)
 		{
-			sendto_one(client, NULL, "FAIL LOGIN %s %s :%s", code, account, reason);
+			
 			unreal_log(ULOG_INFO, "login", "ACCOUNT_LOGIN_FAIL", NULL,
 				   "$client failed to log into account $account",
 				   log_data_string("account", account),
 				   log_data_string("client", client->name ? client->name : "A pre-connected user"));
+			if (HasCapability(client, "sasl"))
+				sendto_one(client, NULL, ":%s 904 %s :%s", me.name, account, reason);
+			else
+				sendto_one(client, NULL, "FAIL LOGIN %s %s :%s", code, account, reason);
 		}
 	}
 
@@ -834,4 +861,108 @@ CMD_FUNC(CMD_LOGIN)
 	json_decref(j);
 	query_api("account", json_serialized, "ns_account_login");
 	add_fake_lag(client, 5000); // lag 'em for 5 seconds
+}
+
+/** SASL */
+CMD_OVERRIDE_FUNC(CMD_AUTHENTICATE_OVR)
+{
+	Client *agent_p = NULL;
+	char *account = (char *)safe_alloc(50), *password = (char *)safe_alloc(400);
+	/* Failing to use CAP REQ for sasl is a protocol violation. */
+	if (BadPtr(parv[1]))
+		return;
+
+	if ((parv[1][0] == ':') || strchr(parv[1], ' '))
+	{
+		sendnumeric(client, ERR_CANNOTDOCOMMAND, "AUTHENTICATE", "Invalid parameter");
+		return;
+	}
+
+	if (strlen(parv[1]) > 400)
+	{
+		sendnumeric(client, ERR_SASLTOOLONG);
+		return;
+	}
+
+	if (client->user == NULL)
+		make_user(client);
+
+	if (!strcasecmp(parv[1], "PLAIN"))
+	{
+		sendto_one(client, NULL, "AUTHENTICATE +");
+		return;
+	}
+
+	char buf[512];
+	int n;
+	n = b64_decode(parv[1], buf, sizeof(buf)-1);
+	if (n <= 1)
+		return;
+
+	char *segments[3] = { NULL }; // Array to store segments
+	int segmentIndex = 0;
+
+	char *ptr = buf;
+	segments[segmentIndex++] = ptr;
+
+	while (segmentIndex < 3) {
+		ptr++;
+		if (*ptr == '\0') {
+			segments[segmentIndex++] = ptr + 1;
+		}
+	}
+	if (segmentIndex != 3)
+		return;
+
+	safe_strdup(account, segments[1]); // Assign the second segment to account
+	safe_strdup(password, segments[2]); // Assign the third segment to password
+	
+	json_t *j;
+	char *json_serialized;
+
+	j = json_object();
+	json_object_set_new(j, "method", json_string_unreal("identify")); // we would like to register plz
+	json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client trying to register
+	json_object_set_new(j, "auth", json_string_unreal(account)); // name of the user
+	json_object_set_new(j, "password", json_string_unreal(password)); // name of the channel they want to register
+
+	json_serialized = json_dumps(j, JSON_COMPACT);
+	if (!json_serialized)
+	{
+		unreal_log(ULOG_WARNING, "login", "BUG_SEREALIZE", client,
+			   "Unable to serialize JSON request. Weird.");
+		json_decref(j);
+		return;
+	}
+	json_decref(j);
+	query_api("account", json_serialized, "ns_account_login");
+	add_fake_lag(client, 5000); // lag 'em for 5 seconds
+	safe_free(account);
+	safe_free(password);
+
+}
+
+int sasl_capability_visible(Client *client)
+{
+	/* Don't advertise 'sasl' capability if we are going to reject the
+	 * user anyway due to set::plaintext-policy. This way the client
+	 * won't attempt SASL authentication and thus it prevents the client
+	 * from sending the password unencrypted (in case of method PLAIN).
+	 */
+	if (client && !IsSecure(client) && !IsLocalhost(client) && (iConf.plaintext_policy_user == POLICY_DENY))
+		return 0;
+
+	/* Similarly, don't advertise when we are going to reject the user
+	 * due to set::outdated-tls-policy.
+	 */
+	if (IsSecure(client) && (iConf.outdated_tls_policy_user == POLICY_DENY) && outdated_tls_client(client))
+		return 0;
+
+	return 1;
+}
+
+
+const char *sasl_capability_parameter(Client *client)
+{
+	return moddata_client_get(&me, "saslmechlist"); /* NOTE: could still return NULL */
 }
