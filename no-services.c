@@ -118,7 +118,7 @@ char *construct_url(const char *base_url, const char *extra_params) {
 ModuleHeader MOD_HEADER
 = {
 	"third/no-services",	/* Name of module */
-	"1.0", /* Version */
+	"1.0.2", /* Version */
 	"Services functionality but without services", /* Short description of module */
 	"Valware",
 	"unrealircd-6",
@@ -889,7 +889,7 @@ CMD_OVERRIDE_FUNC(CMD_AUTHENTICATE_OVR)
 
 	if (!strcasecmp(parv[1], "PLAIN"))
 	{
-		sendto_one(client, NULL, "AUTHENTICATE +");
+		sendto_one(client, NULL, ":%s AUTHENTICATE +", me.name);
 		return;
 	}
 
