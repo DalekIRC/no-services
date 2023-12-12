@@ -30,7 +30,7 @@ Example:
 /REGISTER Valware valerie@valware.co.uk FantasticPasswordWhichDefinitelyNobodyWillEverGuessLmao
 ```
 ### LOGIN
-This logs you into your account based on what nick you are using. Currently authing as an account other than your nick is unsupported. This command will eventually be expanded to allow specifying an account and password, and SASL will be added to be interoperable with existing clients. The syntax is as follows:
+This logs you into your account based on what nick you are using. Currently authing as an account other than your nick is unsupported. This command will eventually be expanded to allow specifying an account and password. Users may also use SASL, but this is a command intended for users to type. The syntax is as follows:
 ```
 /LOGIN <password>
 ```
