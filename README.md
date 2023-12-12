@@ -49,6 +49,24 @@ Example:
 /CREGISTER #mychannel
 ```
 
+## Example Configuration
+
+
+```
+no-services {
+        api-url 'https://example.com/no-services/v1/'; // your api endpoint, don't forget to use single quotes for this.
+        api-key "insert your API key here"; // your API key. you can define separate API keys in the URL API configuration.
+        account-registration {
+                options { // which options for account-registration
+                        before-connect; // let people register before they are fully connected
+                        custom-account-name; // let people choose an account name
+                        email-required; // require that people register using an email address
+                }
+        }
+}
+
+```
+
 ## The Plan
 The plan is to implement as many existing account/channel-related commands into the server, and also many more new things; from `/AJOIN` to manage your auto-join channels list to `/VOTEBAN`, a command channel staff can enable or disable for their channel.
 
