@@ -50,7 +50,7 @@ Example:
 ```
 
 ## The Plan
-The plan is to implement as many existing account/channel-related commands into the server, and also many more new things; from `/AJOIN` to manage your auto-join channels list to `/VOTEBAN', a command channel staff can enable or disable for their channel.
+The plan is to implement as many existing account/channel-related commands into the server, and also many more new things; from `/AJOIN` to manage your auto-join channels list to `/VOTEBAN`, a command channel staff can enable or disable for their channel.
 
 At the time of writing this, the no-services project is very early on, and I'm only a few days into coding it enthusiastically.
 
