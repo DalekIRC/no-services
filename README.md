@@ -20,8 +20,8 @@ In conclusion, the integration of IRC services functions directly within the IRC
 ## Commands
 Below is a list of commands which have been implemented so far and any plans regarding the future.
 
-### REGISTER
-Following the [Account Registration IRCv3 specification](https://ircv3.net/specs/extensions/account-registration), you can register an account with the following syntax:
+### Account Registration
+Following the [Account Registration IRCv3 specification](https://ircv3.net/specs/extensions/account-registration), you can register an account using `/REGISTER` with the following syntax:
 ```
 /REGISTER <account name> <email address> <password>
 ```
@@ -29,8 +29,8 @@ Example:
 ```
 /REGISTER Valware valerie@valware.co.uk FantasticPasswordWhichDefinitelyNobodyWillEverGuessLmao
 ```
-### LOGIN
-This logs you into your account based on what nick you are using. Currently authing as an account other than your nick is unsupported. This command will eventually be expanded to allow specifying an account and password. Users may also use SASL, but this is a command intended for users to type. The syntax is as follows:
+### Logging In
+You have two options here. You may either use SASL PLAIN as is standard in clients, or you can use the command `/LOGIN` to login to your current nick. In the future this will support specifying an account name to log into. The syntax is as follows:
 ```
 /LOGIN <password>
 ```
@@ -39,8 +39,8 @@ Example:
 /LOGIN FantasticPasswordWhichDefinitelyNobodyWillEverGuessLmao
 ```
 
-### CREGISTER
-This will let you register a channel, which sets mode the 'registered mode (`+r`)' on the channel and 'owner status (`+q`)' on you and the syntax is as follows:
+### Channel Registration
+`/CREGISTER` will let you register a channel, which sets mode the 'registered mode (`+r`)' on the channel and 'owner status (`+q`)' on you and the syntax is as follows:
 ```
 /CREGISTER <channel name>
 ```
