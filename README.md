@@ -93,7 +93,7 @@ no-services {
 		password-strength 4;
 	}
 }
-
+```
 ### More configuration considerations
 Using UnrealIRCd's built-in [`set::restrict-commands`](https://www.unrealircd.org/docs/Restrict_commands) functionality, you can really fine-tune things to suit your needs.
 ```
