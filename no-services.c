@@ -160,7 +160,7 @@ char *construct_url(const char *base_url, const char *extra_params) {
 ModuleHeader MOD_HEADER
 = {
 	"third/no-services",	/* Name of module */
-	"1.0.3", /* Version */
+	"1.0.3.1", /* Version */
 	"Services functionality but without services", /* Short description of module */
 	"Valware",
 	"unrealircd-6",
@@ -271,7 +271,7 @@ void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response
 	Client *client = NULL;
 	if (response->errorbuf || !response->memory)
 	{
-		unreal_log(ULOG_INFO, "accreg", "NOSERVICES_API_BAD_RESPONSE", NULL,
+		unreal_log(ULOG_INFO, "register", "NOSERVICES_API_BAD_RESPONSE", NULL,
 				   "Error while trying to check $url: $error",
 				   log_data_string("url", request->url),
 				   log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
@@ -285,7 +285,7 @@ void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response
 	result = json_loads(response->memory, JSON_REJECT_DUPLICATES, &jerr);
 	if (!result)
 	{
-		unreal_log(ULOG_INFO, "accreg", "NOSERVICES_API_BAD_RESPONSE", NULL,
+		unreal_log(ULOG_INFO, "register", "NOSERVICES_API_BAD_RESPONSE", NULL,
 				   "Error while trying to check $url: JSON parse error",
 				   log_data_string("url", request->url));
 		return;
@@ -330,7 +330,7 @@ void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response
 			user_account_login(NULL, client);
 			sendto_server(client, 0, 0, NULL, ":%s SVSLOGIN %s %s %s",
 				  me.name, "*", client->id, client->user->account);
-			unreal_log(ULOG_INFO, "accreg", "ACCOUNT_REGISTRATION", NULL,
+			unreal_log(ULOG_INFO, "register", "ACCOUNT_REGISTRATION", NULL,
 				   "New account: \"$account\" registered to $client",
 				   log_data_string("account", client->user->account),
 				   log_data_string("client", client->name ? client->name : "a pre-connected user"));
@@ -1293,7 +1293,7 @@ void do_ajoin(OutgoingWebRequest *request, OutgoingWebResponse *response)
 	Client *client = NULL;
 	if (response->errorbuf || !response->memory)
 	{
-		unreal_log(ULOG_INFO, "accreg", "NOSERVICES_API_BAD_RESPONSE", NULL,
+		unreal_log(ULOG_INFO, "ajoin", "NOSERVICES_API_BAD_RESPONSE", NULL,
 				   "Error while trying to check $url: $error",
 				   log_data_string("url", request->url),
 				   log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
@@ -1303,7 +1303,7 @@ void do_ajoin(OutgoingWebRequest *request, OutgoingWebResponse *response)
 	result = json_loads(response->memory, JSON_REJECT_DUPLICATES, &jerr);
 	if (!result)
 	{
-		unreal_log(ULOG_INFO, "accreg", "NOSERVICES_API_BAD_RESPONSE", NULL,
+		unreal_log(ULOG_INFO, "ajoin", "NOSERVICES_API_BAD_RESPONSE", NULL,
 				   "Error while trying to check $url: JSON parse error",
 				   log_data_string("url", request->url));
 		return;
