@@ -10,7 +10,7 @@ module
 				"The module is installed. Now all you need to do is add a loadmodule line:";
 				"loadmodule \"third/no-services\";";
 				"And /REHASH the IRCd.";
-				"Please see the README that came with this module for configuration documentation.";
+				"The module does not need any other configuration.";
 		}
 }
 *** <<<MODULE MANAGER END>>>
@@ -26,6 +26,7 @@ void setcfg(void);
 void freecfg(void);
 int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs);
 int noservices_configrun(ConfigFile *cf, ConfigEntry *ce, int type);
+void _do_ajoin(Client *client);
 
 long CAP_ACCOUNTREGISTRATION = 0L;
 long CAP_SASL_OVR = 0L;
@@ -36,7 +37,8 @@ int accreg_capability_visible(Client *client);
 void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response);
 void register_channel(OutgoingWebRequest *request, OutgoingWebResponse *response);
 void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response);
-
+void ajoin(OutgoingWebRequest *request, OutgoingWebResponse *response);
+void do_ajoin(OutgoingWebRequest *request, OutgoingWebResponse *response);
 // draft/account-registration= parameter MD
 void regkeylist_free(ModData *m);
 const char *regkeylist_serialize(ModData *m);
@@ -46,10 +48,12 @@ void regkeylist_unserialize(const char *str, ModData *m);
 int sasl_capability_visible(Client *client);
 const char *sasl_capability_parameter(Client *client);
 
-CMD_FUNC(CMD_REGISTER);
-CMD_FUNC(CMD_CREGISTER);
-CMD_FUNC(CMD_LOGIN);
-CMD_OVERRIDE_FUNC(CMD_AUTHENTICATE_OVR);
+CMD_FUNC(cmd_register);
+CMD_FUNC(cmd_cregister);
+CMD_FUNC(cmd_login);
+CMD_OVERRIDE_FUNC(cmd_authenticate_ovr);
+CMD_FUNC(cmd_ajoin);
+CMD_FUNC(cmd_logout);
 
 
 /* Config struct*/
@@ -59,15 +63,53 @@ struct cfgstruct {
 
 	unsigned short int got_url;
 	unsigned short int got_key;
+	unsigned short int got_password_strength_requirement;
 
 	// account registration
 	int register_before_connect;
 	int register_custom_account;
 	int register_email_required;
+	int password_strength_requirement;
 
 };
 
 static struct cfgstruct cfg;
+
+/** Test the validity of emails*/
+int IsValidEmail(const char *email)
+{
+    if (!strstr(email,"@") || !strstr(email,"."))
+		return 0;
+	return 1;
+}
+
+int noservices_hook_local_connect(Client *client);
+
+int checkPasswordStrength(const char *password, int password_strength_requirement) {
+    int length = strlen(password);
+    int uppercase = 0, lowercase = 0, digits = 0, symbols = 0;
+    
+    for (int i = 0; i < length; i++) {
+        if (isupper(password[i])) {
+            uppercase = 1;
+        } else if (islower(password[i])) {
+            lowercase = 1;
+        } else if (isdigit(password[i])) {
+            digits = 1;
+        } else {
+            symbols = 1;
+        }
+    }
+    
+    int strength = uppercase + lowercase + digits + symbols;
+
+    if (length >= 8 && strength >= password_strength_requirement) {
+        return 1; // Password meets strength requirement
+    } else {
+        return 0; // Password does not meet strength requirement
+    }
+}
+
 
 /** Query the No-Services API
  @param endpoint The endpoint of the API
@@ -118,7 +160,7 @@ char *construct_url(const char *base_url, const char *extra_params) {
 ModuleHeader MOD_HEADER
 = {
 	"third/no-services",	/* Name of module */
-	"1.0.2", /* Version */
+	"1.0.3", /* Version */
 	"Services functionality but without services", /* Short description of module */
 	"Valware",
 	"unrealircd-6",
@@ -130,6 +172,9 @@ MOD_INIT()
 	freecfg();
 	setcfg();
 
+	/** Account Registration cap key value
+	 * eg "before-connect,email-required,custom-account-name"
+	*/
 	ModDataInfo mreq;
 	memset(&mreq, 0, sizeof(mreq));
 	mreq.name = "regkeylist";
@@ -143,9 +188,10 @@ MOD_INIT()
 		return MOD_FAILED;
 	}
 	
+	/** Account Registration cap `draft/account-registration`
+	*/
 	ClientCapabilityInfo accreg_cap; 
 	memset(&accreg_cap, 0, sizeof(accreg_cap));
-
 	accreg_cap.name = REGCAP_NAME;
 	accreg_cap.visible = accreg_capability_visible;
 	accreg_cap.parameter = accreg_capability_parameter;
@@ -156,25 +202,32 @@ MOD_INIT()
 	}
 	
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, noservices_configrun);
+	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_CONNECT, 9999, noservices_hook_local_connect); // we want to be called after auto-oper and such
 	RegisterApiCallbackWebResponse(modinfo->handle, "register_account", register_account);
 	RegisterApiCallbackWebResponse(modinfo->handle, "register_channel", register_channel);
 	RegisterApiCallbackWebResponse(modinfo->handle, "ns_account_login", ns_account_login);
-	CommandOverrideAdd(modinfo->handle, "AUTHENTICATE", 0, CMD_AUTHENTICATE_OVR);
-	CommandAdd(modinfo->handle, "REGISTER", CMD_REGISTER, 3, CMD_USER | CMD_UNREGISTERED);
-	CommandAdd(modinfo->handle, "CREGISTER", CMD_CREGISTER, 3, CMD_USER);
-	CommandAdd(modinfo->handle, "LOGIN", CMD_LOGIN, 3, CMD_USER);
+	RegisterApiCallbackWebResponse(modinfo->handle, "ajoin", ajoin);
+	RegisterApiCallbackWebResponse(modinfo->handle, "do_ajoin", do_ajoin);
+	CommandOverrideAdd(modinfo->handle, "AUTHENTICATE", 0, cmd_authenticate_ovr);
+	CommandAdd(modinfo->handle, "REGISTER", cmd_register, 3, CMD_USER | CMD_UNREGISTERED);
+	CommandAdd(modinfo->handle, "CREGISTER", cmd_cregister, 3, CMD_USER);
+	CommandAdd(modinfo->handle, "LOGIN", cmd_login, 3, CMD_USER);
+	CommandAdd(modinfo->handle, "LOGOUT", cmd_logout, MAXPARA, CMD_USER);
+	CommandAdd(modinfo->handle, "AJOIN", cmd_ajoin, MAXPARA, CMD_USER);
 
+	// Here, we take control of SASL but don't unload the original module because we
+	// still wanna make use of the original event timer without duplicating code =]
+	// so, remove the old ClientCapability for SASL
 	ClientCapability *clicap = ClientCapabilityFindReal("sasl");
 	ClientCapabilityDel(clicap);
 
+	// and put our own version
 	ClientCapabilityInfo cap;
 	memset(&cap, 0, sizeof(cap));
 	cap.name = "sasl";
 	cap.visible = sasl_capability_visible;
 	cap.parameter = sasl_capability_parameter;
 	ClientCapabilityAdd(modinfo->handle, &cap, &CAP_SASL_OVR);
-
-	moddata_client_set(&me, "saslmechlist", "PLAIN");
 
 	return MOD_SUCCESS;
 }
@@ -284,7 +337,7 @@ void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response
 		}
 		else if (!success && code && account)
 		{
-			sendto_one(client, NULL, "FAIL REGISTER %s %s :%s", code, account, reason);
+			sendto_one(client, NULL, ":%s FAIL REGISTER %s %s :%s", me.name, code, account, reason);
 		}
 	}
 
@@ -296,22 +349,65 @@ void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response
 /** Register accounts
  * /REGISTER <account name> <email> <password>
  */
-CMD_FUNC(CMD_REGISTER)
+CMD_FUNC(cmd_register)
 {
 	if (IsLoggedIn(client))
 	{
-		sendto_one(client, NULL, "FAIL REGISTER ALREADY_AUTHENTICATED %s :You are already authenticated to an account.", client->user->account);
+		sendto_one(client, NULL, ":%s FAIL REGISTER ALREADY_AUTHENTICATED %s :You are already authenticated to an account.", me.name, client->user->account);
 		return;
 	}
 	if (BadPtr(parv[1]) || BadPtr(parv[2]) || BadPtr(parv[3]))
 	{
-		sendto_one(client, NULL, "FAIL REGISTER INVALID_PARAMS :Syntax: /REGISTER <account name> <email> <password>");
+		sendto_one(client, NULL, ":%s FAIL REGISTER INVALID_PARAMS :Syntax: /REGISTER <account name> <email> <password>", me.name);
 		return;
 	}
 
 	if (BadPtr(cfg.url) || BadPtr(cfg.key)) // no api set? no registration
 	{
-		sendto_one(client, NULL, "FAIL REGISTER TEMPORARILY_UNAVAILABLE %s :Registration has not been configured on this server.", parv[1]);
+		sendto_one(client, NULL, ":%s FAIL REGISTER TEMPORARILY_UNAVAILABLE %s :Registration has not been configured on this server.", me.name, parv[1]);
+		return;
+	}
+
+	if ((!IsUser(client) && MyConnect(client)) && !cfg.register_before_connect)
+	{
+		sendto_one(client, NULL, ":%s FAIL REGISTER COMPLETE_CONNECTION_REQUIRED %s :You must fully connect before registering an account.", me.name, parv[1]);
+		return;
+	}
+	char account[NICKLEN + 2];
+	
+	strlcpy(account, (!strcmp(parv[1],"*")) ? client->name : parv[1], iConf.nick_length + 1);
+	// Account name stuff
+	// accounts follow nick standard
+	if (!cfg.register_custom_account && strcmp(parv[1],"*") == -1 && strcmp(parv[1], client->name))
+	{
+		sendto_one(client, NULL, ":%s FAIL REGISTER ACCOUNT_NAME_MUST_BE_NICK %s :Your account name must be your nickname.", me.name, account);
+		return;
+	}
+	if (!do_nick_name(account))
+	{
+		sendto_one(client, NULL, ":%s FAIL REGISTER BAD_ACCOUNT_NAME %s :Your account name must be a valid nickname.", me.name, account);
+		return;
+	}
+	// Email stuff
+	if (cfg.register_email_required // we need their email
+		&& ((!strcmp(parv[2],"*")) // and they either didn't give it
+		|| !IsValidEmail(parv[2]))) // or it was invalid
+	{
+		sendto_one(client, NULL, ":%s FAIL REGISTER INVALID_EMAIL %s :Your email address is invalid.", me.name, account);
+		return;
+	}
+
+	if (!checkPasswordStrength(parv[3], cfg.password_strength_requirement))
+	{
+		sendto_one(client, NULL, ":%s FAIL REGISTER PASSWORD_TOO_WEAK %s :Your password is too weak. Please choose a stronger password", me.name, account);
+		return;
+	}
+
+	const char *password_hash = NULL;
+	
+	if (!(password_hash = Auth_Hash(6, parv[3])))
+	{
+		sendto_one(client, NULL, ":%s FAIL REGISTER SERVER_BUG %s :The hashing mechanism was not supported. Please contact an administrator.", me.name, parv[1]);
 		return;
 	}
 	json_t *j;
@@ -320,9 +416,9 @@ CMD_FUNC(CMD_REGISTER)
 	j = json_object();
 	json_object_set_new(j, "method", json_string_unreal("register")); // we would like to register plz
 	json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client trying to register
-	json_object_set_new(j, "account", json_string_unreal(parv[1])); // account name they wanna register (Can be "*")
+	json_object_set_new(j, "account", json_string_unreal(parv[1])); // account name they wanna register
 	json_object_set_new(j, "email", json_string_unreal(parv[2])); // email they wanna use for registration (Can be "*")
-	json_object_set_new(j, "password", json_string_unreal(parv[3])); // password
+	json_object_set_new(j, "password", json_string_unreal(password_hash)); // password
 
 	json_serialized = json_dumps(j, JSON_COMPACT);
 	if (!json_serialized)
@@ -419,7 +515,7 @@ void register_channel(OutgoingWebRequest *request, OutgoingWebResponse *response
 		}
 		else if (!success && code && channel)
 		{
-			sendto_one(client, NULL, "FAIL CREGISTER %s %s :%s", code, channel, reason);
+			sendto_one(client, NULL, ":%s FAIL CREGISTER %s %s :%s", me.name, code, channel, reason);
 		}
 	}
 
@@ -432,34 +528,34 @@ void register_channel(OutgoingWebRequest *request, OutgoingWebResponse *response
 /** Register a channel
  * /CREGISTER <channel>
  */
-CMD_FUNC(CMD_CREGISTER)
+CMD_FUNC(cmd_cregister)
 {
 	Channel *chan;
 	if (BadPtr(parv[1]))
 	{
-		sendto_one(client, NULL, "FAIL CREGISTER INVALID_PARAMS * :Syntax: /CREGISTER <channel name>");
+		sendto_one(client, NULL, ":%s FAIL CREGISTER INVALID_PARAMS * :Syntax: /CREGISTER <channel name>", me.name);
 		return;
 	}
 	if (!IsLoggedIn(client))
 	{
-		sendto_one(client, NULL, "FAIL CREGISTER NOT_LOGGED_IN %s :You must be logged into an account to register a channel.", parv[1]);
+		sendto_one(client, NULL, ":%s FAIL CREGISTER NOT_LOGGED_IN %s :You must be logged into an account to register a channel.", me.name, parv[1]);
 		return;
 	}
 	if (BadPtr(cfg.url) || BadPtr(cfg.key)) // no api set? no registration
 	{
-		sendto_one(client, NULL, "FAIL CREGISTER TEMPORARILY_UNAVAILABLE %s :Registration has not been configured on this server.", parv[1]);
+		sendto_one(client, NULL, ":%s FAIL CREGISTER TEMPORARILY_UNAVAILABLE %s :Registration has not been configured on this server.", me.name, parv[1]);
 		return;
 	}
 
 	chan = find_channel(parv[1]);
 	if (!chan)
 	{
-		sendto_one(client, NULL, "FAIL CREGISTER INVALID_CHANNEL %s :Channel does not exist.", parv[1]);
+		sendto_one(client, NULL, ":%s FAIL CREGISTER INVALID_CHANNEL %s :Channel does not exist.", me.name, parv[1]);
 		return;
 	}
 	if (has_channel_mode(chan, 'r'))
 	{
-		sendto_one(client, NULL, "FAIL CREGISTER ALREADY_REGISTERED %s :Channel is already registered.", parv[1]);
+		sendto_one(client, NULL, ":%s FAIL CREGISTER ALREADY_REGISTERED %s :Channel is already registered.", me.name, parv[1]);
 		return;
 	}
 	if (!IsMember(client, chan))
@@ -469,7 +565,7 @@ CMD_FUNC(CMD_CREGISTER)
 	}
 	if (!check_channel_access(client, chan, "oaq"))
 	{
-		sendto_one(client, NULL, "FAIL CREGISTER NO_ACCESS %s :You may not register that channel.", parv[1]);
+		sendto_one(client, NULL, ":%s FAIL CREGISTER NO_ACCESS %s :You may not register that channel.", me.name, parv[1]);
 		return;
 	}
 
@@ -619,7 +715,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 						if(!strcmp(cep3->name, "custom-account-name"))
 						{
 							if(cfg.register_custom_account) {
-								config_warn("%s:%i: duplicate %s::%s directive, ignoring.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+								config_warn("%s:%i: duplicate %s::%s directive, ignoring.", cep3->file->filename, cep3->line_number, NO_SERVICES_CONF, cep3->name);
 								errors++;
 								continue;
 							}
@@ -630,7 +726,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 						if(!strcmp(cep3->name, "email-required"))
 						{
 							if(cfg.register_email_required) {
-								config_warn("%s:%i: duplicate %s::%s directive, ignoring.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+								config_warn("%s:%i: duplicate %s::%s directive, ignoring.", cep3->file->filename, cep3->line_number, NO_SERVICES_CONF, cep3->name);
 								errors++;
 								continue;
 							}
@@ -641,6 +737,16 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 					}
 					continue;
 				}
+				else if (!strcmp(cep2->name, "password-strength"))
+				{
+					if(cfg.got_password_strength_requirement) {
+						config_warn("%s:%i: duplicate %s::%s directive, ignoring.", cep2->file->filename, cep2->line_number, NO_SERVICES_CONF, cep2->name);
+						errors++;
+						continue;
+					}
+					cfg.got_password_strength_requirement = 1;
+					continue;
+				}
 				config_warn("%s:%i: unknown item %s::%s::%s", cep2->file->filename, cep2->line_number, NO_SERVICES_CONF, cep->name, cep2->name); // Rep0t warn if unknown directive =]
 			}
 			continue;
@@ -648,7 +754,15 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 		// Anything else is unknown to us =]
 		config_warn("%s:%i: unknown item %s::%s", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name); // So display just a warning
 	}
-
+	if (!cfg.got_key || !cfg.got_url)
+	{
+		config_error("[no-services] You have not set your no-services block correctly.");
+		errors++;
+	}
+	if (!cfg.got_password_strength_requirement)
+	{
+		config_warn("[no-services::account-registration::password-strength] You have not set a minimum password strength requirement. Defaulting to strongest possible strength.");
+	}
 	*errs = errors;
 	return errors ? -1 : 1; // Returning 1 means "all good", -1 means we shat our panties
 }
@@ -715,10 +829,18 @@ int noservices_configrun(ConfigFile *cf, ConfigEntry *ce, int type) {
 						}
 					}
 				}
+				else if (!strcmp(cep2->name, "password-strength"))
+				{
+					cfg.got_password_strength_requirement = 1;
+					cfg.password_strength_requirement = atoi(cep2->value);
+					continue;
+				}
 			}
 		}
 	}
-	
+	if (!cfg.got_password_strength_requirement) // you have to explicitly enable 0 to work
+		cfg.password_strength_requirement = 4;
+
 	char *concatenated = (char *)safe_alloc(50);
 	strcpy(concatenated, "");
 
@@ -810,21 +932,24 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 			unreal_log(ULOG_INFO, "login", "ACCOUNT_LOGIN_SUCCESS", NULL,
 				   "$client successfully logged into account $account",
 				   log_data_string("account", client->user->account),
-				   log_data_string("client", client->name ? client->name : "A pre-connected user"));
+				   log_data_string("client", !BadPtr(client->name) ? client->name : "A pre-connected user"));
 			if (HasCapability(client, "sasl"))
 				sendto_one(client, NULL, ":%s 903 %s :SASL authentication successful", me.name, account);
+			if (IsUser(client))
+			{
+				_do_ajoin(client);
+			}
 		}
 		else if (!success && code && account)
 		{
-			
 			unreal_log(ULOG_INFO, "login", "ACCOUNT_LOGIN_FAIL", NULL,
 				   "$client failed to log into account $account",
 				   log_data_string("account", account),
-				   log_data_string("client", client->name ? client->name : "A pre-connected user"));
+				   log_data_string("client", client->name ? client->name : client->id));
 			if (HasCapability(client, "sasl"))
 				sendto_one(client, NULL, ":%s 904 %s :%s", me.name, account, reason);
 			else
-				sendto_one(client, NULL, "FAIL LOGIN %s %s :%s", code, account, reason);
+				sendto_one(client, NULL, ":%s FAIL LOGIN %s %s :%s", me.name, code, account, reason);
 		}
 	}
 
@@ -834,11 +959,11 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 /**
  * /LOGIN <password>
 */
-CMD_FUNC(CMD_LOGIN)
+CMD_FUNC(cmd_login)
 {
 	if (BadPtr(parv[1]))
 	{
-		sendto_one(client, NULL, "FAIL LOGIN INVALID_PARAMS * :Syntax: /LOGIN <password>");
+		sendto_one(client, NULL, ":%s FAIL LOGIN INVALID_PARAMS * :Syntax: /LOGIN <password>", me.name);
 		return;
 	}
 	json_t *j;
@@ -864,12 +989,12 @@ CMD_FUNC(CMD_LOGIN)
 }
 
 /** SASL */
-CMD_OVERRIDE_FUNC(CMD_AUTHENTICATE_OVR)
+CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 {
 	Client *agent_p = NULL;
 	char *account = (char *)safe_alloc(50), *password = (char *)safe_alloc(400);
 	/* Failing to use CAP REQ for sasl is a protocol violation. */
-	if (BadPtr(parv[1]))
+	if (!HasCapability(client, "sasl") || BadPtr(parv[1]))
 		return;
 
 	if ((parv[1][0] == ':') || strchr(parv[1], ' '))
@@ -964,5 +1089,265 @@ int sasl_capability_visible(Client *client)
 
 const char *sasl_capability_parameter(Client *client)
 {
-	return moddata_client_get(&me, "saslmechlist"); /* NOTE: could still return NULL */
+	return "PLAIN"; /* NOTE: could still return NULL */
+}
+
+void ajoin(OutgoingWebRequest *request, OutgoingWebResponse *response)
+{
+	json_t *result;
+	json_error_t jerr;
+	Client *client = NULL;
+
+	if (response->errorbuf || !response->memory)
+	{
+		unreal_log(ULOG_INFO, "ajoin", "NOSERVICES_API_BAD_RESPONSE", NULL,
+				   "Error while trying to check $url: $error",
+				   log_data_string("url", request->url),
+				   log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
+		return;
+	}
+
+	result = json_loads(response->memory, JSON_REJECT_DUPLICATES, &jerr);
+	if (!result)
+	{
+		unreal_log(ULOG_INFO, "ajoin", "NOSERVICES_API_BAD_RESPONSE", NULL,
+				   "Error while trying to check $url: JSON parse error",
+				   log_data_string("url", request->url));
+		return;
+	}
+
+	const char *key;
+	json_t *value;
+	char *reason = NULL;
+	char *code = NULL;
+	char *channel = NULL;
+	int success = 0;
+	char *type = NULL;
+	int add = 0;
+	int list = 0;
+	char *channels_list = "\0";
+
+	json_object_foreach(result, key, value)
+	{
+		if (!strcasecmp(key, "uid"))
+		{
+			client = find_client(json_string_value(value), NULL);
+		}
+		else if (!strcasecmp(key, "success") || !strcasecmp(key, "error"))
+		{
+			if (!strcasecmp(key, "success"))
+			{
+				success = 1;
+			}
+			reason = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "code"))
+		{
+			code = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "channel"))
+		{
+			channel = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "autojoin"))
+		{
+			const char *key2;
+			json_t *value2;
+			int i = 0;
+
+			json_object_foreach(value, key2, value2)
+			{
+				sendto_one(client, NULL, ":%s NOTE AJOIN LIST :%s", me.name, json_string_value(value2));
+			}
+			sendto_one(client, NULL, ":%s NOTE AJOIN END_OF_LIST :End of autojoin list.", me.name);
+		}
+		else if (!strcasecmp(key, "type"))
+		{
+			type = strdup(json_string_value(value));
+			if (!strcmp(type,"add"))
+				add++;
+			else if (!strcmp(type,"list"))
+				list++;
+		}
+	}
+
+	if (success && channel)
+	{
+		sendto_one(client, NULL, ":%s AJOIN %s SUCCESS %s :You have successfully %s %s %s your auto-join list.", me.name, (add) ? "ADD" : "DEL", channel, (add) ? "added" : "deleted", channel, (add) ? "to" : "from");
+	}
+	else if (channel && reason && code)
+	{
+		sendto_one(client, NULL, ":%s FAIL AJOIN %s :Could not %s %s your auto-join list: %s", me.name, channel, (add) ? "add" : "delete", (add) ? "to" : "from", reason);
+	}
+	
+	json_decref(result);
+}
+
+CMD_FUNC(cmd_ajoin)
+{
+	if (!IsLoggedIn(client))
+	{
+		sendto_one(client, NULL, ":%s FAIL AJOIN NOT_LOGGED_IN :You must be logged into an account to manage it.", me.name);
+		return;
+	}
+	Channel *chan;
+	// we already checked they're logged in
+	if (BadPtr(parv[1]))
+		return;
+
+	json_t *j;
+	char *json_serialized;
+	j = json_object();
+
+	if (!strcasecmp(parv[1],"add") && !BadPtr(parv[2]))
+	{
+		chan = find_channel(parv[2]);
+		if (!chan || !IsMember(client, chan))
+		{
+			sendto_one(client, NULL, ":%s FAIL AJOIN NOT_ON_CHANNEL %s :You cannot add channels which you are not on to your auto-join list.", me.name, parv[2]);
+			return;
+		}
+		json_object_set_new(j, "method", json_string_unreal("ajoin add")); // add the channel
+	}
+
+	else if (!strcasecmp(parv[1],"del") && !BadPtr(parv[2])) // we don't care if it exists or not
+		json_object_set_new(j, "method", json_string_unreal("ajoin del")); // delete the channel
+	else if (!strcasecmp(parv[1],"list"))
+		json_object_set_new(j, "method", json_string_unreal("ajoin list")); // list the channels lmao
+	
+	json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client
+	json_object_set_new(j, "account", json_string_unreal(client->user->account)); // ID of the client
+	if (!BadPtr(parv[2]))
+		json_object_set_new(j, "channel", json_string_unreal(parv[2])); // name of the user
+
+	json_serialized = json_dumps(j, JSON_COMPACT);
+	if (!json_serialized)
+	{
+		unreal_log(ULOG_WARNING, "login", "BUG_SEREALIZE", client,
+			   "Unable to serialize JSON request. Weird.");
+		json_decref(j);
+		return;
+	}
+	json_decref(j);
+	query_api("account", json_serialized, "ajoin");
+	add_fake_lag(client, 1000); // lag 'em for 5 seconds
+}
+
+
+CMD_FUNC(cmd_logout)
+{
+	if (!IsLoggedIn(client))
+	{
+		sendto_one(client, NULL, ":%s FAIL LOGOUT NOT_LOGGED_IN :You must be logged into an account to log out.", me.name);
+		return;
+	}
+	strlcpy(client->user->account, "0", sizeof(client->user->account));
+	if (client->umodes & UMODE_REGNICK)
+	{
+		if (MyUser(client))
+			sendto_one(client, NULL, ":%s MODE %s :-r", client->name, client->name);
+		client->umodes &= ~UMODE_REGNICK;
+	}
+	user_account_login(recv_mtags, client);
+	sendto_server(client, 0, 0, NULL, ":%s SVSLOGIN * %s 0", me.id, client->name);
+}
+
+
+int noservices_hook_local_connect(Client *client)
+{
+	if (!IsLoggedIn(client))
+		return 0;
+
+	_do_ajoin(client);
+	return 0;
+}
+
+void _do_ajoin(Client *client)
+{
+	json_t *j;
+	char *json_serialized;
+	j = json_object();
+	json_object_set_new(j, "method", json_string_unreal("ajoin list"));
+	json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client
+	json_object_set_new(j, "account", json_string_unreal(client->user->account)); // ID of the client
+	json_serialized = json_dumps(j, JSON_COMPACT);
+	if (!json_serialized)
+	{
+		unreal_log(ULOG_WARNING, "noserviceslocalcon", "BUG_SEREALIZE", client,
+			   "Unable to serialize JSON request. Weird.");
+		json_decref(j);
+		return;
+	}
+
+	json_decref(j);
+	query_api("account", json_serialized, "do_ajoin");
+	add_fake_lag(client, 1000); // lag 'em for 5 seconds
+	return;
+}
+
+
+void do_ajoin(OutgoingWebRequest *request, OutgoingWebResponse *response)
+{
+	json_t *result;
+	json_error_t jerr;
+	Client *client = NULL;
+	if (response->errorbuf || !response->memory)
+	{
+		unreal_log(ULOG_INFO, "accreg", "NOSERVICES_API_BAD_RESPONSE", NULL,
+				   "Error while trying to check $url: $error",
+				   log_data_string("url", request->url),
+				   log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
+		return;
+	}
+
+	result = json_loads(response->memory, JSON_REJECT_DUPLICATES, &jerr);
+	if (!result)
+	{
+		unreal_log(ULOG_INFO, "accreg", "NOSERVICES_API_BAD_RESPONSE", NULL,
+				   "Error while trying to check $url: JSON parse error",
+				   log_data_string("url", request->url));
+		return;
+	}
+	const char *key;
+	json_t *value;
+	char *reason = NULL;
+	char *code = NULL;
+	char *account = NULL;
+	int success = 0;
+	json_object_foreach(result, key, value)
+	{
+		if (!strcasecmp(key, "uid"))
+		{
+			client = find_client(json_string_value(value), NULL);
+		}
+		else if (!strcasecmp(key, "success") || !strcasecmp(key, "error"))
+		{
+			if (!strcasecmp(key, "success"))
+			{
+				success = 1;
+			}
+			reason = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "code"))
+		{
+			code = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "autojoin"))
+		{
+			if (!client)
+				continue;
+			const char *key2;
+			json_t *value2;
+			int i = 0;
+			json_object_foreach(value, key2, value2)
+			{
+				const char *parv[3];
+				parv[0] = client->name;
+				parv[1] = json_string_value(value2);
+				parv[2] = NULL;
+				do_cmd(client, NULL, "JOIN", 2, parv);
+			}
+		}
+	}
+	json_decref(result);
 }
