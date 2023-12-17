@@ -19,14 +19,50 @@ module
 #include "unrealircd.h"
 
 #define NO_SERVICES_CONF "no-services"
-
 #define REGCAP_NAME "draft/account-registration"
+
+// Runs both when a fully-connected user authenticates or an authenticated user fully-connects lol
+#define HOOKTYPE_NOSERV_CONNECT_AND_LOGIN 800
+
+/** Called when a local user quits or otherwise disconnects (function prototype for HOOKTYPE_PRE_LOCAL_QUIT).
+ * @param client		The client
+ * @param result		 	A JSON object about the user
+ *
+ *	{
+ *		"id": 29,
+ *		"account_name": "bob",
+ *		"first_name": null,
+ *		"last_name": null,
+ *		"password": "$argon2id$v=19$m=6144,t=2,p=2$P5bUJuJSarijl8abOiV1Lw$GIbxA06zp3Kk1pjWjcSc8E0MwgfBUAuO5MjfhYpksUI",
+ *		"email": "bob@example.cn",
+ *		"activated": null,
+ *		"last_login": null,
+ *		"registered_at": "2023-12-10 23:38:06",
+ *		"roles": null,
+ *		"meta": {
+ *		"0": {
+ *			"id": 11,
+ *			"user_id": "bob",
+ *			"meta_name": "ajoin",
+ *			"meta_value": "#services"
+ *		},
+ *		"1": {
+ *			"id": 12,
+ *			"user_id": "bob",
+ *			"meta_name": "ajoin",
+ *			"meta_value": "#opers"
+ *		}
+ *	}
+ *
+ *	For an actual example, see `void do_ajoin(){...}`
+ */
+void hooktype_noserv_connect_and_login(Client *client, json_t *result);
 
 void setcfg(void);
 void freecfg(void);
 int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs);
 int noservices_configrun(ConfigFile *cf, ConfigEntry *ce, int type);
-void _do_ajoin(Client *client);
+void connect_query_user(Client *client);
 
 long CAP_ACCOUNTREGISTRATION = 0L;
 long CAP_SASL_OVR = 0L;
@@ -37,13 +73,15 @@ int accreg_capability_visible(Client *client);
 void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response);
 void register_channel(OutgoingWebRequest *request, OutgoingWebResponse *response);
 void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response);
-void ajoin(OutgoingWebRequest *request, OutgoingWebResponse *response);
-void do_ajoin(OutgoingWebRequest *request, OutgoingWebResponse *response);
+void ajoin_callback(OutgoingWebRequest *request, OutgoingWebResponse *response);
+void connect_query_user_response(OutgoingWebRequest *request, OutgoingWebResponse *response);
 // draft/account-registration= parameter MD
 void regkeylist_free(ModData *m);
 const char *regkeylist_serialize(ModData *m);
 void regkeylist_unserialize(const char *str, ModData *m);
+int noservices_hook_local_connect(Client *client);
 
+void do_ajoin(Client *client, json_t *result);
 
 int sasl_capability_visible(Client *client);
 const char *sasl_capability_parameter(Client *client);
@@ -78,36 +116,35 @@ static struct cfgstruct cfg;
 /** Test the validity of emails*/
 int IsValidEmail(const char *email)
 {
-    if (!strstr(email,"@") || !strstr(email,"."))
+	if (!strstr(email,"@") || !strstr(email,"."))
 		return 0;
 	return 1;
 }
 
-int noservices_hook_local_connect(Client *client);
 
 int checkPasswordStrength(const char *password, int password_strength_requirement) {
-    int length = strlen(password);
-    int uppercase = 0, lowercase = 0, digits = 0, symbols = 0;
-    
-    for (int i = 0; i < length; i++) {
-        if (isupper(password[i])) {
-            uppercase = 1;
-        } else if (islower(password[i])) {
-            lowercase = 1;
-        } else if (isdigit(password[i])) {
-            digits = 1;
-        } else {
-            symbols = 1;
-        }
-    }
-    
-    int strength = uppercase + lowercase + digits + symbols;
+	int length = strlen(password);
+	int uppercase = 0, lowercase = 0, digits = 0, symbols = 0;
+	
+	for (int i = 0; i < length; i++) {
+		if (isupper(password[i])) {
+			uppercase = 1;
+		} else if (islower(password[i])) {
+			lowercase = 1;
+		} else if (isdigit(password[i])) {
+			digits = 1;
+		} else {
+			symbols = 1;
+		}
+	}
+	
+	int strength = uppercase + lowercase + digits + symbols;
 
-    if (length >= 8 && strength >= password_strength_requirement) {
-        return 1; // Password meets strength requirement
-    } else {
-        return 0; // Password does not meet strength requirement
-    }
+	if (length >= 8 && strength >= password_strength_requirement) {
+		return 1; // Password meets strength requirement
+	} else {
+		return 0; // Password does not meet strength requirement
+	}
 }
 
 
@@ -117,6 +154,30 @@ int checkPasswordStrength(const char *password, int password_strength_requiremen
  @param callback The callback function
 */
 void query_api(const char *endpoint, char *body, const char *callback)
+{
+	OutgoingWebRequest *w = safe_alloc(sizeof(OutgoingWebRequest));
+	json_t *j;
+	NameValuePrioList *headers = NULL;
+	add_nvplist(&headers, 0, "Content-Type", "application/json; charset=utf-8");
+	add_nvplist(&headers, 0, "X-API-Key", cfg.key);
+	/* Do the web request */
+	char *our_url = construct_url(cfg.url, endpoint);
+	safe_strdup(w->url, our_url);
+	w->http_method = HTTP_METHOD_POST;
+	w->body = body;
+	w->headers = headers;
+	w->max_redirects = 1;
+	safe_strdup(w->apicallback, callback);
+	url_start_async(w);
+	free(our_url);
+}
+
+/** Query the No-Services API
+ @param endpoint The endpoint of the API
+ @param body The body to POST, typically JSON
+ @param callback The callback function
+*/
+void send_email(const char *endpoint, char *body, const char *callback)
 {
 	OutgoingWebRequest *w = safe_alloc(sizeof(OutgoingWebRequest));
 	json_t *j;
@@ -160,7 +221,7 @@ char *construct_url(const char *base_url, const char *extra_params) {
 ModuleHeader MOD_HEADER
 = {
 	"third/no-services",	/* Name of module */
-	"1.0.3.1", /* Version */
+	"1.0.3.2", /* Version */
 	"Services functionality but without services", /* Short description of module */
 	"Valware",
 	"unrealircd-6",
@@ -203,11 +264,12 @@ MOD_INIT()
 	
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, noservices_configrun);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_CONNECT, 9999, noservices_hook_local_connect); // we want to be called after auto-oper and such
+	HookAddVoid(modinfo->handle, HOOKTYPE_NOSERV_CONNECT_AND_LOGIN, 0, do_ajoin); // custom hook baby
 	RegisterApiCallbackWebResponse(modinfo->handle, "register_account", register_account);
 	RegisterApiCallbackWebResponse(modinfo->handle, "register_channel", register_channel);
 	RegisterApiCallbackWebResponse(modinfo->handle, "ns_account_login", ns_account_login);
-	RegisterApiCallbackWebResponse(modinfo->handle, "ajoin", ajoin);
-	RegisterApiCallbackWebResponse(modinfo->handle, "do_ajoin", do_ajoin);
+	RegisterApiCallbackWebResponse(modinfo->handle, "ajoin_callback", ajoin_callback);
+	RegisterApiCallbackWebResponse(modinfo->handle, "connect_query_user_response", connect_query_user_response);
 	CommandOverrideAdd(modinfo->handle, "AUTHENTICATE", 0, cmd_authenticate_ovr);
 	CommandAdd(modinfo->handle, "REGISTER", cmd_register, 3, CMD_USER | CMD_UNREGISTERED);
 	CommandAdd(modinfo->handle, "CREGISTER", cmd_cregister, 3, CMD_USER);
@@ -272,9 +334,9 @@ void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response
 	if (response->errorbuf || !response->memory)
 	{
 		unreal_log(ULOG_INFO, "register", "NOSERVICES_API_BAD_RESPONSE", NULL,
-				   "Error while trying to check $url: $error",
-				   log_data_string("url", request->url),
-				   log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
+					"Error while trying to check $url: $error",
+					log_data_string("url", request->url),
+					log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
 		return;
 	}
 
@@ -286,8 +348,8 @@ void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response
 	if (!result)
 	{
 		unreal_log(ULOG_INFO, "register", "NOSERVICES_API_BAD_RESPONSE", NULL,
-				   "Error while trying to check $url: JSON parse error",
-				   log_data_string("url", request->url));
+					"Error while trying to check $url: JSON parse error",
+					log_data_string("url", request->url));
 		return;
 	}
 	const char *key;
@@ -328,12 +390,16 @@ void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response
 			strlcpy(client->user->account, account, sizeof(client->user->account));
 			sendto_one(client, NULL, "REGISTER SUCCESS %s %s", account, reason);
 			user_account_login(NULL, client);
+
+			if (IsUser(client))
+				RunHook(HOOKTYPE_NOSERV_CONNECT_AND_LOGIN, client, result);
+
 			sendto_server(client, 0, 0, NULL, ":%s SVSLOGIN %s %s %s",
-				  me.name, "*", client->id, client->user->account);
+					me.name, "*", client->id, client->user->account);
 			unreal_log(ULOG_INFO, "register", "ACCOUNT_REGISTRATION", NULL,
-				   "New account: \"$account\" registered to $client",
-				   log_data_string("account", client->user->account),
-				   log_data_string("client", client->name ? client->name : "a pre-connected user"));
+					"New account: \"$account\" registered to $client",
+					log_data_string("account", client->user->account),
+					log_data_string("client", client->name ? client->name : "a pre-connected user"));
 		}
 		else if (!success && code && account)
 		{
@@ -424,7 +490,7 @@ CMD_FUNC(cmd_register)
 	if (!json_serialized)
 	{
 		unreal_log(ULOG_WARNING, "registration", "BUG_SEREALIZE", client,
-			   "Unable to serialize JSON request. Weird.");
+				"Unable to serialize JSON request. Weird.");
 		json_decref(j);
 		return;
 	}
@@ -444,9 +510,9 @@ void register_channel(OutgoingWebRequest *request, OutgoingWebResponse *response
 	if (response->errorbuf || !response->memory)
 	{
 		unreal_log(ULOG_INFO, "chanreg", "NOSERVICES_API_BAD_RESPONSE", NULL,
-				   "Error while trying to check $url: $error",
-				   log_data_string("url", request->url),
-				   log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
+					"Error while trying to check $url: $error",
+					log_data_string("url", request->url),
+					log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
 		return;
 	}
 
@@ -458,8 +524,8 @@ void register_channel(OutgoingWebRequest *request, OutgoingWebResponse *response
 	if (!result)
 	{
 		unreal_log(ULOG_INFO, "chanreg", "NOSERVICES_API_BAD_RESPONSE", NULL,
-				   "Error while trying to check $url: JSON parse error",
-				   log_data_string("url", request->url));
+					"Error while trying to check $url: JSON parse error",
+					log_data_string("url", request->url));
 		return;
 	}
 	const char *key;
@@ -508,9 +574,9 @@ void register_channel(OutgoingWebRequest *request, OutgoingWebResponse *response
 			do_mode(chan, &me, NULL, 3, mode_args, 0, 0);// make this ACTUALLY sent by the server for the mode_is_ok check
 			sendto_one(client, NULL, "CREGISTER SUCCESS %s :Channel %s has been registered to your account", chan->name, client->user->account);
 			unreal_log(ULOG_INFO, "chanreg", "CHANNEL_REGISTRATION", NULL,
-				   "New channel: \"$chan\" registered to account \"$account\"",
-				   log_data_string("chan", channel),
-				   log_data_string("account", client->user->account));
+					"New channel: \"$chan\" registered to account \"$account\"",
+					log_data_string("chan", channel),
+					log_data_string("account", client->user->account));
 			
 		}
 		else if (!success && code && channel)
@@ -582,7 +648,7 @@ CMD_FUNC(cmd_cregister)
 	if (!json_serialized)
 	{
 		unreal_log(ULOG_WARNING, "chanreg", "BUG_SEREALIZE", client,
-			   "Unable to serialize JSON request. Weird.");
+				"Unable to serialize JSON request. Weird.");
 		json_decref(j);
 		return;
 	}
@@ -872,9 +938,9 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 	if (response->errorbuf || !response->memory)
 	{
 		unreal_log(ULOG_INFO, "chanreg", "NOSERVICES_API_BAD_RESPONSE", NULL,
-				   "Error while trying to check $url: $error",
-				   log_data_string("url", request->url),
-				   log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
+					"Error while trying to check $url: $error",
+					log_data_string("url", request->url),
+					log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
 		return;
 	}
 
@@ -886,8 +952,8 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 	if (!result)
 	{
 		unreal_log(ULOG_INFO, "chanreg", "NOSERVICES_API_BAD_RESPONSE", NULL,
-				   "Error while trying to check $url: JSON parse error",
-				   log_data_string("url", request->url));
+					"Error while trying to check $url: JSON parse error",
+					log_data_string("url", request->url));
 		return;
 	}
 	const char *key;
@@ -928,24 +994,23 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 			strlcpy(client->user->account, account, sizeof(client->user->account));
 			user_account_login(NULL, client);
 			sendto_server(client, 0, 0, NULL, ":%s SVSLOGIN %s %s %s",
-				  me.name, "*", client->id, client->user->account);
+					me.name, "*", client->id, client->user->account);
+			if (IsUser(client))
+				RunHook(HOOKTYPE_NOSERV_CONNECT_AND_LOGIN, client, result);
 			unreal_log(ULOG_INFO, "login", "ACCOUNT_LOGIN_SUCCESS", NULL,
-				   "$client successfully logged into account $account",
-				   log_data_string("account", client->user->account),
-				   log_data_string("client", !BadPtr(client->name) ? client->name : "A pre-connected user"));
+					"$client successfully logged into account $account",
+					log_data_string("account", client->user->account),
+					log_data_string("client", !BadPtr(client->name) ? client->name : "A pre-connected user"));
 			if (HasCapability(client, "sasl"))
 				sendto_one(client, NULL, ":%s 903 %s :SASL authentication successful", me.name, account);
-			if (IsUser(client))
-			{
-				_do_ajoin(client);
-			}
+
 		}
 		else if (!success && code && account)
 		{
 			unreal_log(ULOG_INFO, "login", "ACCOUNT_LOGIN_FAIL", NULL,
-				   "$client failed to log into account $account",
-				   log_data_string("account", account),
-				   log_data_string("client", client->name ? client->name : client->id));
+					"$client failed to log into account $account",
+					log_data_string("account", account),
+					log_data_string("client", client->name ? client->name : client->id));
 			if (HasCapability(client, "sasl"))
 				sendto_one(client, NULL, ":%s 904 %s :%s", me.name, account, reason);
 			else
@@ -979,7 +1044,7 @@ CMD_FUNC(cmd_login)
 	if (!json_serialized)
 	{
 		unreal_log(ULOG_WARNING, "login", "BUG_SEREALIZE", client,
-			   "Unable to serialize JSON request. Weird.");
+				"Unable to serialize JSON request. Weird.");
 		json_decref(j);
 		return;
 	}
@@ -1049,13 +1114,13 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 	json_object_set_new(j, "method", json_string_unreal("identify")); // we would like to register plz
 	json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client trying to register
 	json_object_set_new(j, "auth", json_string_unreal(account)); // name of the user
-	json_object_set_new(j, "password", json_string_unreal(password)); // name of the channel they want to register
+	json_object_set_new(j, "password", json_string_unreal(password)); // name of the user
 
 	json_serialized = json_dumps(j, JSON_COMPACT);
 	if (!json_serialized)
 	{
 		unreal_log(ULOG_WARNING, "login", "BUG_SEREALIZE", client,
-			   "Unable to serialize JSON request. Weird.");
+				"Unable to serialize JSON request. Weird.");
 		json_decref(j);
 		return;
 	}
@@ -1092,7 +1157,7 @@ const char *sasl_capability_parameter(Client *client)
 	return "PLAIN"; /* NOTE: could still return NULL */
 }
 
-void ajoin(OutgoingWebRequest *request, OutgoingWebResponse *response)
+void ajoin_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
 {
 	json_t *result;
 	json_error_t jerr;
@@ -1101,9 +1166,9 @@ void ajoin(OutgoingWebRequest *request, OutgoingWebResponse *response)
 	if (response->errorbuf || !response->memory)
 	{
 		unreal_log(ULOG_INFO, "ajoin", "NOSERVICES_API_BAD_RESPONSE", NULL,
-				   "Error while trying to check $url: $error",
-				   log_data_string("url", request->url),
-				   log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
+					"Error while trying to check $url: $error",
+					log_data_string("url", request->url),
+					log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
 		return;
 	}
 
@@ -1111,8 +1176,8 @@ void ajoin(OutgoingWebRequest *request, OutgoingWebResponse *response)
 	if (!result)
 	{
 		unreal_log(ULOG_INFO, "ajoin", "NOSERVICES_API_BAD_RESPONSE", NULL,
-				   "Error while trying to check $url: JSON parse error",
-				   log_data_string("url", request->url));
+					"Error while trying to check $url: JSON parse error",
+					log_data_string("url", request->url));
 		return;
 	}
 
@@ -1224,12 +1289,12 @@ CMD_FUNC(cmd_ajoin)
 	if (!json_serialized)
 	{
 		unreal_log(ULOG_WARNING, "login", "BUG_SEREALIZE", client,
-			   "Unable to serialize JSON request. Weird.");
+				"Unable to serialize JSON request. Weird.");
 		json_decref(j);
 		return;
 	}
 	json_decref(j);
-	query_api("account", json_serialized, "ajoin");
+	query_api("account", json_serialized, "ajoin_callback");
 	add_fake_lag(client, 1000); // lag 'em for 5 seconds
 }
 
@@ -1257,57 +1322,65 @@ int noservices_hook_local_connect(Client *client)
 {
 	if (!IsLoggedIn(client))
 		return 0;
-
-	_do_ajoin(client);
+	connect_query_user(client);
 	return 0;
 }
 
-void _do_ajoin(Client *client)
+void connect_query_user(Client *client)
 {
 	json_t *j;
 	char *json_serialized;
 	j = json_object();
-	json_object_set_new(j, "method", json_string_unreal("ajoin list"));
+	json_object_set_new(j, "method", json_string_unreal("find"));
 	json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client
 	json_object_set_new(j, "account", json_string_unreal(client->user->account)); // ID of the client
 	json_serialized = json_dumps(j, JSON_COMPACT);
 	if (!json_serialized)
 	{
 		unreal_log(ULOG_WARNING, "noserviceslocalcon", "BUG_SEREALIZE", client,
-			   "Unable to serialize JSON request. Weird.");
+				"Unable to serialize JSON request. Weird.");
 		json_decref(j);
 		return;
 	}
 
 	json_decref(j);
-	query_api("account", json_serialized, "do_ajoin");
+	query_api("account", json_serialized, "connect_query_user_response");
 	add_fake_lag(client, 1000); // lag 'em for 5 seconds
 	return;
 }
 
 
-void do_ajoin(OutgoingWebRequest *request, OutgoingWebResponse *response)
+void connect_query_user_response(OutgoingWebRequest *request, OutgoingWebResponse *response)
 {
 	json_t *result;
 	json_error_t jerr;
 	Client *client = NULL;
 	if (response->errorbuf || !response->memory)
 	{
-		unreal_log(ULOG_INFO, "ajoin", "NOSERVICES_API_BAD_RESPONSE", NULL,
-				   "Error while trying to check $url: $error",
-				   log_data_string("url", request->url),
-				   log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
+		unreal_log(ULOG_INFO, "no-services-connect", "NOSERVICES_API_BAD_RESPONSE", NULL,
+					"Error while trying to check $url: $error",
+					log_data_string("url", request->url),
+					log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
 		return;
 	}
 
 	result = json_loads(response->memory, JSON_REJECT_DUPLICATES, &jerr);
 	if (!result)
 	{
-		unreal_log(ULOG_INFO, "ajoin", "NOSERVICES_API_BAD_RESPONSE", NULL,
-				   "Error while trying to check $url: JSON parse error",
-				   log_data_string("url", request->url));
+		unreal_log(ULOG_INFO, "no-services-connect", "NOSERVICES_API_BAD_RESPONSE", NULL,
+					"Error while trying to check $url: JSON parse error",
+					log_data_string("url", request->url));
 		return;
 	}
+
+	RunHook(HOOKTYPE_NOSERV_CONNECT_AND_LOGIN, client, result);
+	
+	json_decref(result);
+}
+
+// Search 
+void do_ajoin(Client *client, json_t *result)
+{
 	const char *key;
 	json_t *value;
 	char *reason = NULL;
@@ -1332,22 +1405,47 @@ void do_ajoin(OutgoingWebRequest *request, OutgoingWebResponse *response)
 		{
 			code = strdup(json_string_value(value));
 		}
-		else if (!strcasecmp(key, "autojoin"))
+		else if (!strcasecmp(key, "user"))
 		{
-			if (!client)
-				continue;
 			const char *key2;
 			json_t *value2;
-			int i = 0;
 			json_object_foreach(value, key2, value2)
 			{
-				const char *parv[3];
-				parv[0] = client->name;
-				parv[1] = json_string_value(value2);
-				parv[2] = NULL;
-				do_cmd(client, NULL, "JOIN", 2, parv);
+				if (!strcasecmp(key2, "meta"))
+				{
+					const char *key3;
+					json_t *value3;
+					json_object_foreach(value2, key3, value3)
+					{
+						const char *key4;
+						json_t *value4;
+						int is_ajoin = 0;
+						json_object_foreach(value3, key4, value4)
+						{
+							if (!strcasecmp(key4, "meta_name") && !strcasecmp(json_string_value(value4),"ajoin"))
+							{
+								is_ajoin++;
+								continue;
+							}
+							if (!strcasecmp(key4,"meta_value") && is_ajoin)
+							{
+								const char *parv[3];
+								parv[0] = client->name;
+								parv[1] = json_string_value(value4);
+								parv[2] = NULL;
+								do_cmd(client, NULL, "JOIN", 2, parv);
+								is_ajoin = 0;
+							}
+							continue;
+						}
+						continue;
+					}
+					continue;
+				}
+				continue;
 			}
+			continue;
 		}
 	}
-	json_decref(result);
 }
+
