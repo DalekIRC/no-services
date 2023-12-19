@@ -1,3 +1,8 @@
+/*
+  Licence: GPLv3
+  Copyright Ⓒ 2024 Valerie Pond
+  */
+#define NOSERVICES_VERSION "1.0.1.4"
 
 /*** <<<MODULE MANAGER START>>>
 module
@@ -20,7 +25,9 @@ module
 
 #define NO_SERVICES_CONF "no-services"
 #define REGCAP_NAME "draft/account-registration"
-
+#define CERTFP_DEL 0
+#define CERTFP_ADD 1
+#define CERTFP_LIST 2
 // Runs both when a fully-connected user authenticates or an authenticated user fully-connects lol
 #define HOOKTYPE_NOSERV_CONNECT_AND_LOGIN 800
 
@@ -57,6 +64,15 @@ module
  *	For an actual example, see `void do_ajoin(){...}`
  */
 void hooktype_noserv_connect_and_login(Client *client, json_t *result);
+// sasl stuff
+#define SASL_TYPE_NONE 0
+#define SASL_TYPE_PLAIN 1
+#define SASL_TYPE_EXTERNAL 2
+#define GetSaslType(x)			(moddata_client(x, sasl_md).i)
+#define SetSaslType(x, y)		do { moddata_client(x, sasl_md).i = y; } while(0)
+#define DelSaslType(x)		do { moddata_client(x, sasl_md).i = SASL_TYPE_NONE; } while(0)
+ModDataInfo *sasl_md;
+
 
 void setcfg(void);
 void freecfg(void);
@@ -75,10 +91,18 @@ void register_channel(OutgoingWebRequest *request, OutgoingWebResponse *response
 void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response);
 void ajoin_callback(OutgoingWebRequest *request, OutgoingWebResponse *response);
 void connect_query_user_response(OutgoingWebRequest *request, OutgoingWebResponse *response);
+void certfp_callback(OutgoingWebRequest *request, OutgoingWebResponse *response);
+
 // draft/account-registration= parameter MD
 void regkeylist_free(ModData *m);
 const char *regkeylist_serialize(ModData *m);
 void regkeylist_unserialize(const char *str, ModData *m);
+
+// Who's SASLing how
+void sat_free(ModData *m);
+const char *sat_serialize(ModData *m);
+void sat_unserialize(const char *str, ModData *m);
+
 int noservices_hook_local_connect(Client *client);
 
 void do_ajoin(Client *client, json_t *result);
@@ -92,6 +116,7 @@ CMD_FUNC(cmd_login);
 CMD_OVERRIDE_FUNC(cmd_authenticate_ovr);
 CMD_FUNC(cmd_ajoin);
 CMD_FUNC(cmd_logout);
+CMD_FUNC(cmd_certfp);
 
 
 /* Config struct*/
@@ -221,7 +246,7 @@ char *construct_url(const char *base_url, const char *extra_params) {
 ModuleHeader MOD_HEADER
 = {
 	"third/no-services",	/* Name of module */
-	"1.0.3.2", /* Version */
+	NOSERVICES_VERSION, /* Version */
 	"Services functionality but without services", /* Short description of module */
 	"Valware",
 	"unrealircd-6",
@@ -249,6 +274,17 @@ MOD_INIT()
 		return MOD_FAILED;
 	}
 	
+	memset(&mreq, 0, sizeof(mreq));
+	mreq.name = "sasl_auth_type";
+	mreq.free = sat_free;
+	mreq.serialize = sat_serialize;
+	mreq.unserialize = sat_unserialize;
+	mreq.type = MODDATATYPE_CLIENT;
+	if (!(sasl_md = ModDataAdd(modinfo->handle, mreq)))
+	{
+		config_error("Could not add ModData for sasl_auth_type");
+		return MOD_FAILED;
+	}
 	/** Account Registration cap `draft/account-registration`
 	*/
 	ClientCapabilityInfo accreg_cap; 
@@ -269,6 +305,7 @@ MOD_INIT()
 	RegisterApiCallbackWebResponse(modinfo->handle, "register_channel", register_channel);
 	RegisterApiCallbackWebResponse(modinfo->handle, "ns_account_login", ns_account_login);
 	RegisterApiCallbackWebResponse(modinfo->handle, "ajoin_callback", ajoin_callback);
+	RegisterApiCallbackWebResponse(modinfo->handle, "certfp_callback", certfp_callback);
 	RegisterApiCallbackWebResponse(modinfo->handle, "connect_query_user_response", connect_query_user_response);
 	CommandOverrideAdd(modinfo->handle, "AUTHENTICATE", 0, cmd_authenticate_ovr);
 	CommandAdd(modinfo->handle, "REGISTER", cmd_register, 3, CMD_USER | CMD_UNREGISTERED);
@@ -276,6 +313,7 @@ MOD_INIT()
 	CommandAdd(modinfo->handle, "LOGIN", cmd_login, 3, CMD_USER);
 	CommandAdd(modinfo->handle, "LOGOUT", cmd_logout, MAXPARA, CMD_USER);
 	CommandAdd(modinfo->handle, "AJOIN", cmd_ajoin, MAXPARA, CMD_USER);
+	CommandAdd(modinfo->handle, "CERTFP", cmd_certfp, 2, CMD_USER);
 
 	// Here, we take control of SASL but don't unload the original module because we
 	// still wanna make use of the original event timer without duplicating code =]
@@ -679,6 +717,22 @@ void regkeylist_unserialize(const char *str, ModData *m)
 	safe_strdup(m->str, str);
 }
 
+const char *sat_serialize(ModData *m)
+{
+	static char buf[32];
+	if (m->i == 0)
+		return NULL; /* not set */
+	snprintf(buf, sizeof(buf), "%d", m->i);
+	return buf;
+}
+void sat_free(ModData *m)
+{
+    m->i = 0;
+}
+void sat_unserialize(const char *str, ModData *m)
+{
+    m->i = atoi(str);
+}
 const char *accreg_capability_parameter(Client *client)
 {
 	return moddata_client_get(&me, "regkeylist");
@@ -986,7 +1040,7 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 		}
 	}
 
-	if (client) // if our client is still online and our channel still exists and they're in it
+	if (client) // if our client is still online
 	{
 		// yay they registered
 		if (success)
@@ -1015,6 +1069,7 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 				sendto_one(client, NULL, ":%s 904 %s :%s", me.name, account, reason);
 			else
 				sendto_one(client, NULL, ":%s FAIL LOGIN %s %s :%s", me.name, code, account, reason);
+			add_fake_lag(client, 10000); // ten second penalty for bad logins
 		}
 	}
 
@@ -1050,14 +1105,16 @@ CMD_FUNC(cmd_login)
 	}
 	json_decref(j);
 	query_api("account", json_serialized, "ns_account_login");
-	add_fake_lag(client, 5000); // lag 'em for 5 seconds
+	add_fake_lag(client, 2000);
 }
 
 /** SASL */
 CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 {
 	Client *agent_p = NULL;
-	char *account = (char *)safe_alloc(50), *password = (char *)safe_alloc(400);
+	json_t *j;
+	char *json_serialized;
+
 	/* Failing to use CAP REQ for sasl is a protocol violation. */
 	if (!HasCapability(client, "sasl") || BadPtr(parv[1]))
 		return;
@@ -1079,57 +1136,94 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 
 	if (!strcasecmp(parv[1], "PLAIN"))
 	{
+		SetSaslType(client, SASL_TYPE_PLAIN);
 		sendto_one(client, NULL, ":%s AUTHENTICATE +", me.name);
 		return;
 	}
+	else if (!strcasecmp(parv[1], "EXTERNAL"))
+		SetSaslType(client, SASL_TYPE_EXTERNAL);
 
-	char buf[512];
-	int n;
-	n = b64_decode(parv[1], buf, sizeof(buf)-1);
-	if (n <= 1)
+	if (!GetSaslType(client) || GetSaslType(client) == SASL_TYPE_NONE)
 		return;
 
-	char *segments[3] = { NULL }; // Array to store segments
-	int segmentIndex = 0;
-
-	char *ptr = buf;
-	segments[segmentIndex++] = ptr;
-
-	while (segmentIndex < 3) {
-		ptr++;
-		if (*ptr == '\0') {
-			segments[segmentIndex++] = ptr + 1;
-		}
-	}
-	if (segmentIndex != 3)
-		return;
-
-	safe_strdup(account, segments[1]); // Assign the second segment to account
-	safe_strdup(password, segments[2]); // Assign the third segment to password
-	
-	json_t *j;
-	char *json_serialized;
-
-	j = json_object();
-	json_object_set_new(j, "method", json_string_unreal("identify")); // we would like to register plz
-	json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client trying to register
-	json_object_set_new(j, "auth", json_string_unreal(account)); // name of the user
-	json_object_set_new(j, "password", json_string_unreal(password)); // name of the user
-
-	json_serialized = json_dumps(j, JSON_COMPACT);
-	if (!json_serialized)
+	else if (GetSaslType(client) == SASL_TYPE_PLAIN)
 	{
-		unreal_log(ULOG_WARNING, "login", "BUG_SEREALIZE", client,
-				"Unable to serialize JSON request. Weird.");
-		json_decref(j);
-		return;
-	}
-	json_decref(j);
-	query_api("account", json_serialized, "ns_account_login");
-	add_fake_lag(client, 5000); // lag 'em for 5 seconds
-	safe_free(account);
-	safe_free(password);
+		j = json_object();
+		char *account = (char *)safe_alloc(50), *password = (char *)safe_alloc(400);
+		char buf[512];
+		int n;
+		n = b64_decode(parv[1], buf, sizeof(buf)-1);
+		if (n <= 1)
+		{
+			json_decref(j);
+			return;
+		}
+		char *segments[3] = { NULL }; // Array to store segments
+		int segmentIndex = 0;
 
+		char *ptr = buf;
+		segments[segmentIndex++] = ptr;
+
+		while (segmentIndex < 3) {
+			ptr++;
+			if (*ptr == '\0') {
+				segments[segmentIndex++] = ptr + 1;
+			}
+		}
+		if (segmentIndex != 3)
+		{
+			json_decref(j);
+			return;
+		}
+		safe_strdup(account, segments[1]); // Assign the second segment to account
+		safe_strdup(password, segments[2]); // Assign the third segment to password
+
+		j = json_object();
+		json_object_set_new(j, "method", json_string_unreal("identify")); // we would like to register plz
+		json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client trying to register
+		json_object_set_new(j, "auth", json_string_unreal(account)); // name of the user
+		json_object_set_new(j, "password", json_string_unreal(password)); // name of the user
+
+		json_serialized = json_dumps(j, JSON_COMPACT);
+		if (!json_serialized)
+		{
+			unreal_log(ULOG_WARNING, "login", "BUG_SEREALIZE", client,
+					"Unable to serialize JSON request. Weird.");
+			json_decref(j);
+			return;
+		}
+		json_decref(j);
+		query_api("account", json_serialized, "ns_account_login");
+		safe_free(account);
+		safe_free(password);
+	}
+	else if (GetSaslType(client) == SASL_TYPE_EXTERNAL)
+	{
+		j = json_object();
+		ModDataInfo *moddata;
+		moddata = findmoddata_byname("certfp", MODDATATYPE_CLIENT);
+		if (!moddata || !moddata_client(client, moddata).str)
+		{
+			json_decref(j);
+			sendto_one(client, NULL, ":%s FAIL CERTFP NO_CERT :You don't have a Certificate Fingerprint to add.", me.name);
+			return;
+		}
+		json_object_set_new(j, "method", json_string_unreal("identify cert")); // we would like to register plz
+		json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client trying to register
+		json_object_set_new(j, "cert", json_string_unreal(moddata_client(client, moddata).str)); // cert to lookup
+
+		json_serialized = json_dumps(j, JSON_COMPACT);
+		if (!json_serialized)
+		{
+			unreal_log(ULOG_WARNING, "login", "BUG_SEREALIZE", client,
+					"Unable to serialize JSON request. Weird.");
+			json_decref(j);
+			return;
+		}
+		json_decref(j);
+		query_api("account", json_serialized, "ns_account_login");
+	}
+	DelSaslType(client);
 }
 
 int sasl_capability_visible(Client *client)
@@ -1154,7 +1248,7 @@ int sasl_capability_visible(Client *client)
 
 const char *sasl_capability_parameter(Client *client)
 {
-	return "PLAIN"; /* NOTE: could still return NULL */
+	return "PLAIN,EXTERNAL"; /* NOTE: could still return NULL */
 }
 
 void ajoin_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
@@ -1345,7 +1439,7 @@ void connect_query_user(Client *client)
 
 	json_decref(j);
 	query_api("account", json_serialized, "connect_query_user_response");
-	add_fake_lag(client, 1000); // lag 'em for 5 seconds
+	add_fake_lag(client, 1000);
 	return;
 }
 
@@ -1449,3 +1543,144 @@ void do_ajoin(Client *client, json_t *result)
 	}
 }
 
+int certfp_helper(Client *client, int type, const char *param)
+{
+	json_t *j;
+	char *json_serialized;
+	j = json_object();
+	if (type == CERTFP_ADD)
+		json_object_set_new(j, "method", json_string_unreal("certfp add"));
+	else if (type == CERTFP_DEL)
+		json_object_set_new(j, "method", json_string_unreal("certfp del"));
+	else if (type == CERTFP_LIST)
+		json_object_set_new(j, "method", json_string_unreal("certfp list"));
+	if (param)
+		json_object_set_new(j, "cert", json_string_unreal(param));
+	
+	json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client
+	json_object_set_new(j, "account", json_string_unreal(client->user->account)); // ID of the client
+	json_serialized = json_dumps(j, JSON_COMPACT);
+	if (!json_serialized)
+	{
+		unreal_log(ULOG_WARNING, "noserviceslocalcon", "BUG_SEREALIZE", client,
+				"Unable to serialize JSON request. Weird.");
+		json_decref(j);
+		return 0;
+	}
+
+	json_decref(j);
+	query_api("account", json_serialized, "certfp_callback");
+	add_fake_lag(client, 500); // lag 'em for 5 seconds
+	return 1;
+}
+/** CertFP command
+ * View or manage your saved Certificate Fingerprint list
+ */
+CMD_FUNC(cmd_certfp)
+{
+	if (!IsLoggedIn(client))
+		sendnumeric(client, ERR_NEEDREGGEDNICK, "CERTFP");
+		
+	else if (!strcasecmp(parv[1],"add"))
+	{
+		ModDataInfo *moddata;
+		moddata = findmoddata_byname("certfp", MODDATATYPE_CLIENT);
+		if (!moddata || !moddata_client(client, moddata).str)
+		{
+			sendto_one(client, NULL, ":%s FAIL CERTFP NO_CERT :You don't have a Certificate Fingerprint to add.", me.name);
+			return;
+		}
+		certfp_helper(client, CERTFP_ADD, moddata_client(client, moddata).str);
+		return;
+	}
+	else if (!strcasecmp(parv[1],"list"))
+		certfp_helper(client, CERTFP_LIST, NULL);
+	
+	else if (!strcasecmp(parv[1],"del"))
+	{
+		if (!parv[2])
+		{
+			sendto_one(client, NULL, ":%s FAIL CERTFP INVALID_PARAM :You did not specify a fingerprint to delete.", me.name);
+			return;
+		}
+		certfp_helper(client, CERTFP_DEL, parv[2]);
+	}
+	add_fake_lag(client, 500);
+}
+
+
+void certfp_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
+{
+	json_t *result;
+	json_error_t jerr;
+	Client *client = NULL;
+	if (response->errorbuf || !response->memory)
+	{
+		unreal_log(ULOG_INFO, "no-services-connect", "NOSERVICES_API_BAD_RESPONSE", NULL,
+					"Error while trying to check $url: $error",
+					log_data_string("url", request->url),
+					log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
+		return;
+	}
+
+	result = json_loads(response->memory, JSON_REJECT_DUPLICATES, &jerr);
+	if (!result)
+	{
+		unreal_log(ULOG_INFO, "no-services-connect", "NOSERVICES_API_BAD_RESPONSE", NULL,
+					"Error while trying to check $url: JSON parse error",
+					log_data_string("url", request->url));
+		return;
+	}
+
+	const char *key;
+	json_t *value;
+	char *type = NULL;
+	char *reason = NULL;
+	char *code = NULL;
+	char *cert = NULL;
+	int success = 0;
+	json_object_foreach(result, key, value)
+	{
+		if (!strcasecmp(key, "uid"))
+		{
+			client = find_client(json_string_value(value), NULL);
+		}
+		if (!strcasecmp(key, "type"))
+		{
+			type = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "success") || !strcasecmp(key, "error"))
+		{
+			if (!strcasecmp(key, "success"))
+			{
+				success = 1;
+			}
+			reason = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "code"))
+		{
+			code = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "cert"))
+		{
+			cert = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "list"))
+		{
+			const char *key2;
+			json_t *value2;
+			json_object_foreach(value, key2, value2)
+			{
+				sendto_one(client, NULL, ":%s NOTE CERTFP LIST :%s", me.name, json_string_value(value2));
+			}
+			sendto_one(client, NULL, ":%s NOTE CERTFP END_OF_LIST :End of CertFP list", me.name);
+		}
+	}
+	if (client && success && cert)
+		sendto_one(client, NULL, ":%s NOTE CERTFP UPDATE_SUCCESSFUL %s :You have successfully updated your Certificate Fingerprint list.", me.name, cert);
+
+	else if (client && !success && code && reason)
+		sendto_one(client, NULL, ":%s FAIL CERTFP %s %s :%s", me.name, code, cert, reason);
+	
+	json_decref(result);
+}
