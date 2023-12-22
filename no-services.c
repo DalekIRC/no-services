@@ -2,7 +2,7 @@
   Licence: GPLv3
   Copyright Ⓒ 2024 Valerie Pond
   */
-#define NOSERVICES_VERSION "1.0.1.4"
+#define NOSERVICES_VERSION "1.2.3.4"
 
 /*** <<<MODULE MANAGER START>>>
 module
@@ -69,10 +69,21 @@ void hooktype_noserv_connect_and_login(Client *client, json_t *result);
 #define SASL_TYPE_PLAIN 1
 #define SASL_TYPE_EXTERNAL 2
 #define GetSaslType(x)			(moddata_client(x, sasl_md).i)
-#define SetSaslType(x, y)		do { moddata_client(x, sasl_md).i = y; } while(0)
-#define DelSaslType(x)		do { moddata_client(x, sasl_md).i = SASL_TYPE_NONE; } while(0)
+#define SetSaslType(x, y)		do { moddata_client(x, sasl_md).i = y; } while (0)
+#define DelSaslType(x)		do { moddata_client(x, sasl_md).i = SASL_TYPE_NONE; } while (0)
 ModDataInfo *sasl_md;
 
+// nick enforcement
+#define UserRequiresLogin(x)			(moddata_client(x, need_login).i)
+#define RequireLogin(x)		do { moddata_client(x, need_login).i = 1; } while (0)
+#define UnrequireLogin(x)		do { moddata_client(x, need_login).i = 0; } while (0)
+ModDataInfo *need_login;
+
+// nick drop key
+#define GetDropKey(x)			(moddata_client_get(x, "need_login"))
+#define WantsToDrop(x, y)		do { moddata_client_set(x, "need_login", y); } while (0)
+#define NoLongerWantsToDrop(x)		do { moddata_client_set(x, "need_login"	, "0"); } while (0)
+ModDataInfo *need_login;
 
 void setcfg(void);
 void freecfg(void);
@@ -92,6 +103,7 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 void ajoin_callback(OutgoingWebRequest *request, OutgoingWebResponse *response);
 void connect_query_user_response(OutgoingWebRequest *request, OutgoingWebResponse *response);
 void certfp_callback(OutgoingWebRequest *request, OutgoingWebResponse *response);
+void nick_account_enforce(OutgoingWebRequest *request, OutgoingWebResponse *response);
 
 // draft/account-registration= parameter MD
 void regkeylist_free(ModData *m);
@@ -103,7 +115,13 @@ void sat_free(ModData *m);
 const char *sat_serialize(ModData *m);
 void sat_unserialize(const char *str, ModData *m);
 
+// Who's SASLing how
+void need_login_free(ModData *m);
+const char *need_login_serialize(ModData *m);
+void need_login_unserialize(const char *str, ModData *m);
+
 int noservices_hook_local_connect(Client *client);
+int noservices_hook_post_local_nickchange(Client *client, MessageTag *mtags, const char *oldnick);
 
 void do_ajoin(Client *client, json_t *result);
 
@@ -117,8 +135,16 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr);
 CMD_FUNC(cmd_ajoin);
 CMD_FUNC(cmd_logout);
 CMD_FUNC(cmd_certfp);
+CMD_FUNC(cmd_release);
+CMD_FUNC(cmd_drop);
 
-
+EVENT(nick_enforce);
+int random_number(int low, int high)
+{
+	int number = rand() % ((high+1) - low) + low;
+ 
+	return number;
+}
 /* Config struct*/
 struct cfgstruct {
 	char *url;
@@ -127,23 +153,44 @@ struct cfgstruct {
 	unsigned short int got_url;
 	unsigned short int got_key;
 	unsigned short int got_password_strength_requirement;
+	unsigned short int got_guest_nick;
+	unsigned short int got_nick_enforcement_timeout;
 
 	// account registration
 	int register_before_connect;
 	int register_custom_account;
 	int register_email_required;
 	int password_strength_requirement;
+	
+	// sasl
+	long nick_enforce_timeout;
+	char *guest_nick;
 
 };
 
 static struct cfgstruct cfg;
 
-/** Test the validity of emails*/
+/** "Test" the "validity" of emails*/
 int IsValidEmail(const char *email)
 {
 	if (!strstr(email,"@") || !strstr(email,"."))
 		return 0;
 	return 1;
+}
+
+// copied from source: src/rpc/name_bans.c
+TKL *my_find_tkl_nameban(const char *name)
+{
+	TKL *tkl;
+
+	for (tkl = tklines[tkl_hash('Q')]; tkl; tkl = tkl->next)
+	{
+		if (!TKLIsNameBan(tkl))
+			continue;
+		if (!strcasecmp(name, tkl->ptr.nameban->name))
+			return tkl;
+	}
+	return NULL;
 }
 
 
@@ -197,29 +244,6 @@ void query_api(const char *endpoint, char *body, const char *callback)
 	free(our_url);
 }
 
-/** Query the No-Services API
- @param endpoint The endpoint of the API
- @param body The body to POST, typically JSON
- @param callback The callback function
-*/
-void send_email(const char *endpoint, char *body, const char *callback)
-{
-	OutgoingWebRequest *w = safe_alloc(sizeof(OutgoingWebRequest));
-	json_t *j;
-	NameValuePrioList *headers = NULL;
-	add_nvplist(&headers, 0, "Content-Type", "application/json; charset=utf-8");
-	add_nvplist(&headers, 0, "X-API-Key", cfg.key);
-	/* Do the web request */
-	char *our_url = construct_url(cfg.url, endpoint);
-	safe_strdup(w->url, our_url);
-	w->http_method = HTTP_METHOD_POST;
-	w->body = body;
-	w->headers = headers;
-	w->max_redirects = 1;
-	safe_strdup(w->apicallback, callback);
-	url_start_async(w);
-	free(our_url);
-}
 
 char *construct_url(const char *base_url, const char *extra_params) {
 	size_t base_len = strlen(base_url);
@@ -241,6 +265,7 @@ char *construct_url(const char *base_url, const char *extra_params) {
 	}
 	return url;
 }
+
 
 
 ModuleHeader MOD_HEADER
@@ -285,6 +310,18 @@ MOD_INIT()
 		config_error("Could not add ModData for sasl_auth_type");
 		return MOD_FAILED;
 	}
+	
+	memset(&mreq, 0, sizeof(mreq));
+	mreq.name = "need_login";
+	mreq.free = need_login_free;
+	mreq.serialize = need_login_serialize;
+	mreq.unserialize = need_login_unserialize;
+	mreq.type = MODDATATYPE_CLIENT;
+	if (!(need_login = ModDataAdd(modinfo->handle, mreq)))
+	{
+		config_error("Could not add ModData for sasl_auth_type");
+		return MOD_FAILED;
+	}
 	/** Account Registration cap `draft/account-registration`
 	*/
 	ClientCapabilityInfo accreg_cap; 
@@ -300,6 +337,7 @@ MOD_INIT()
 	
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, noservices_configrun);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_CONNECT, 9999, noservices_hook_local_connect); // we want to be called after auto-oper and such
+	HookAdd(modinfo->handle, HOOKTYPE_POST_LOCAL_NICKCHANGE, 0, noservices_hook_post_local_nickchange);
 	HookAddVoid(modinfo->handle, HOOKTYPE_NOSERV_CONNECT_AND_LOGIN, 0, do_ajoin); // custom hook baby
 	RegisterApiCallbackWebResponse(modinfo->handle, "register_account", register_account);
 	RegisterApiCallbackWebResponse(modinfo->handle, "register_channel", register_channel);
@@ -307,6 +345,7 @@ MOD_INIT()
 	RegisterApiCallbackWebResponse(modinfo->handle, "ajoin_callback", ajoin_callback);
 	RegisterApiCallbackWebResponse(modinfo->handle, "certfp_callback", certfp_callback);
 	RegisterApiCallbackWebResponse(modinfo->handle, "connect_query_user_response", connect_query_user_response);
+	RegisterApiCallbackWebResponse(modinfo->handle, "nick_account_enforce", nick_account_enforce);
 	CommandOverrideAdd(modinfo->handle, "AUTHENTICATE", 0, cmd_authenticate_ovr);
 	CommandAdd(modinfo->handle, "REGISTER", cmd_register, 3, CMD_USER | CMD_UNREGISTERED);
 	CommandAdd(modinfo->handle, "CREGISTER", cmd_cregister, 3, CMD_USER);
@@ -314,6 +353,9 @@ MOD_INIT()
 	CommandAdd(modinfo->handle, "LOGOUT", cmd_logout, MAXPARA, CMD_USER);
 	CommandAdd(modinfo->handle, "AJOIN", cmd_ajoin, MAXPARA, CMD_USER);
 	CommandAdd(modinfo->handle, "CERTFP", cmd_certfp, 2, CMD_USER);
+	CommandAdd(modinfo->handle, "RELEASE", cmd_release, 2, CMD_USER);
+	CommandAdd(modinfo->handle, "DROP", cmd_drop, 2, CMD_USER);
+	EventAdd(modinfo->handle, "nick_enforce", nick_enforce, NULL, 1000, 0);
 
 	// Here, we take control of SASL but don't unload the original module because we
 	// still wanna make use of the original event timer without duplicating code =]
@@ -354,6 +396,7 @@ void freecfg(void)
 {
 	safe_free(cfg.url);
 	safe_free(cfg.key);
+	safe_free(cfg.guest_nick);
 	memset(&cfg, 0, sizeof(cfg));
 }
 
@@ -361,6 +404,8 @@ void setcfg(void)
 {
 	safe_strdup(cfg.url, "");
 	safe_strdup(cfg.key, "");
+	safe_strdup(cfg.guest_nick, "Guest"); // default
+	cfg.nick_enforce_timeout = 60; // 2 minutes to auth before nick gets changed
 }
 
 // callback for registering accounts
@@ -465,7 +510,38 @@ CMD_FUNC(cmd_register)
 		sendto_one(client, NULL, ":%s FAIL REGISTER INVALID_PARAMS :Syntax: /REGISTER <account name> <email> <password>", me.name);
 		return;
 	}
+	TKL *nameban;
+	nameban = my_find_tkl_nameban(parv[1]);
+	if (nameban)
+	{
+		sendto_one(client, NULL, ":%s FAIL REGISTER BANNED_NICK %s :You may not register that nick.", me.name, parv[1]);
+		return;
+	}
+	int len = strlen(parv[1]);
+	if (len < 4) {
+        sendto_one(client, NULL, ":%s FAIL REGISTER INVALID_NAME %s :Your account name must be at least 4 characters long..", me.name, parv[1]);
+		return;
+    }
 
+	// protect against registering serv names lol
+    const char *target = "serv";
+    int match = 1;
+    // Compare the last 4 characters
+    int i;
+    for (i = 0; i < 4; i++) {
+        char strChar = tolower(parv[1][len - 4 + i]); // Convert string character to lowercase
+        char targetChar = tolower(target[i]);    // Convert target character to lowercase
+        
+        if (strChar != targetChar) {
+            match = 0; // Characters don't match
+			break;
+        }
+    }
+	if (match)
+	{
+		sendto_one(client, NULL, ":%s FAIL REGISTER BANNED_NICK %s :You may not register that nick.", me.name, parv[1]);
+		return;
+	}
 	if (BadPtr(cfg.url) || BadPtr(cfg.key)) // no api set? no registration
 	{
 		sendto_one(client, NULL, ":%s FAIL REGISTER TEMPORARILY_UNAVAILABLE %s :Registration has not been configured on this server.", me.name, parv[1]);
@@ -733,6 +809,22 @@ void sat_unserialize(const char *str, ModData *m)
 {
     m->i = atoi(str);
 }
+const char *need_login_serialize(ModData *m)
+{
+	static char buf[32];
+	if (m->i == 0)
+		return NULL; /* not set */
+	snprintf(buf, sizeof(buf), "%d", m->i);
+	return buf;
+}
+void need_login_free(ModData *m)
+{
+    m->i = 0;
+}
+void need_login_unserialize(const char *str, ModData *m)
+{
+    m->i = atoi(str);
+}
 const char *accreg_capability_parameter(Client *client)
 {
 	return moddata_client_get(&me, "regkeylist");
@@ -746,32 +838,32 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 	ConfigEntry *cep, *cep2, *cep3; // To store the current variable/value pair etc, nested
 
 	// Since we'll add a top-level block to unrealircd.conf, need to filter on CONFIG_MAIN lmao
-	if(type != CONFIG_MAIN)
+	if (type != CONFIG_MAIN)
 		return 0; // Returning 0 means idgaf bout dis
 
 	// Check for valid config entries first
-	if(!ce || !ce->name)
+	if (!ce || !ce->name)
 		return 0;
 
 	// If it isn't our block, idc
-	if(strcmp(ce->name, NO_SERVICES_CONF))
+	if (strcmp(ce->name, NO_SERVICES_CONF))
 		return 0;
 
 	// Loop dat shyte
-	for(cep = ce->items; cep; cep = cep->next)
+	for (cep = ce->items; cep; cep = cep->next)
 	{
 		// Do we even have a valid name l0l?
 		// This should already be checked by Unreal's core functions but there's no harm in having it here too =]
-		if(!cep->name)
+		if (!cep->name)
 		{
 			config_error("%s:%i: blank %s item", cep->file->filename, cep->line_number, NO_SERVICES_CONF); // Rep0t error
 			errors++; // Increment err0r count
 			continue; // Next iteration imo tbh
 		}
 
-		if(!strcmp(cep->name, "api-url"))
+		if (!strcmp(cep->name, "api-url"))
 		{
-			if(cfg.got_url)
+			if (cfg.got_url)
 			{
 				config_error("%s:%i: duplicate %s::%s directive. Only one URL is supported at this time.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 				errors++;
@@ -779,18 +871,19 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 			}
 
 			cfg.got_url = 1;
-			if(!strlen(cep->value))
+			if (!strlen(cep->value))
 			{
 				config_error("%s:%i: %s::%s must be non-empty", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 				errors++;
+				continue;
 			}
 
 			continue;
 		}
 
-		if(!strcmp(cep->name, "api-key"))
+		if (!strcmp(cep->name, "api-key"))
 		{
-			if(cfg.got_key)
+			if (cfg.got_key)
 			{
 				config_error("%s:%i: duplicate %s::%s directive", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 				errors++;
@@ -798,32 +891,69 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 			}
 
 			cfg.got_key = 1;
-			if(!strlen(cep->value))
+			if (!strlen(cep->value))
 			{
 				config_error("%s:%i: %s::%s must be non-empty", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 				errors++;
+				continue;
 			}
 			continue;
 		}
-		
-		if(!strcmp(cep->name, "account-registration"))
+		if (!strcmp(cep->name, "nick-enforcement-timeout"))
 		{
-			for(cep2 = cep->items; cep2; cep2 = cep2->next)
+			if (cfg.got_nick_enforcement_timeout)
 			{
-				if(!cep2->name)
+				config_error("%s:%i: duplicate %s::%s directive.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+				errors++;
+				continue;
+			}
+			if (config_checkval(cep->value, CFG_TIME) <= 0)
+			{
+				config_error("%s:%i: %s::%s must be a time string like '7d10m' or simply '20'", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+				errors++;
+				continue;
+			}
+			cfg.got_nick_enforcement_timeout = 1;
+			continue;
+		}
+		
+		if (!strcmp(cep->name, "guest-nick"))
+		{
+			if (cfg.got_guest_nick)
+			{
+				config_error("%s:%i: duplicate %s::%s directive.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+				errors++;
+				continue;
+			}
+			if (!strlen(cep->value))
+			{
+				config_error("%s:%i: %s::%s must be non-empty", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+				errors++;
+				continue;
+			}
+			cfg.got_guest_nick = 1;
+			continue;
+		}
+		
+		
+		if (!strcmp(cep->name, "account-registration"))
+		{
+			for (cep2 = cep->items; cep2; cep2 = cep2->next)
+			{
+				if (!cep2->name)
 				{
 					config_error("%s:%i: blank %s::%s entry", cep2->file->filename, cep2->line_number, NO_SERVICES_CONF, cep->name); // Rep0t error
 					errors++;
 					continue;
 				}
 
-				if(!strcmp(cep2->name, "options"))
+				if (!strcmp(cep2->name, "options"))
 				{
 					for (cep3 = cep2->items; cep3; cep3 = cep3->next)
 					{
-						if(!strcmp(cep3->name, "before-connect"))
+						if (!strcmp(cep3->name, "before-connect"))
 						{
-							if(cfg.register_before_connect) {
+							if (cfg.register_before_connect) {
 								config_warn("%s:%i: duplicate %s::%s directive, ignoring.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 								errors++;
 								continue;
@@ -832,9 +962,9 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 							continue;
 						}
 						
-						if(!strcmp(cep3->name, "custom-account-name"))
+						if (!strcmp(cep3->name, "custom-account-name"))
 						{
-							if(cfg.register_custom_account) {
+							if (cfg.register_custom_account) {
 								config_warn("%s:%i: duplicate %s::%s directive, ignoring.", cep3->file->filename, cep3->line_number, NO_SERVICES_CONF, cep3->name);
 								errors++;
 								continue;
@@ -843,9 +973,9 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 							continue;
 						}
 
-						if(!strcmp(cep3->name, "email-required"))
+						if (!strcmp(cep3->name, "email-required"))
 						{
-							if(cfg.register_email_required) {
+							if (cfg.register_email_required) {
 								config_warn("%s:%i: duplicate %s::%s directive, ignoring.", cep3->file->filename, cep3->line_number, NO_SERVICES_CONF, cep3->name);
 								errors++;
 								continue;
@@ -859,7 +989,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 				}
 				else if (!strcmp(cep2->name, "password-strength"))
 				{
-					if(cfg.got_password_strength_requirement) {
+					if (cfg.got_password_strength_requirement) {
 						config_warn("%s:%i: duplicate %s::%s directive, ignoring.", cep2->file->filename, cep2->line_number, NO_SERVICES_CONF, cep2->name);
 						errors++;
 						continue;
@@ -879,10 +1009,12 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 		config_error("[no-services] You have not set your no-services block correctly.");
 		errors++;
 	}
+	
 	if (!cfg.got_password_strength_requirement)
 	{
 		config_warn("[no-services::account-registration::password-strength] You have not set a minimum password strength requirement. Defaulting to strongest possible strength.");
 	}
+
 	*errs = errors;
 	return errors ? -1 : 1; // Returning 1 means "all good", -1 means we shat our panties
 }
@@ -893,56 +1025,64 @@ int noservices_configrun(ConfigFile *cf, ConfigEntry *ce, int type) {
 	ConfigEntry *cep, *cep2, *cep3; // To store the current variable/value pair etc, nested
 
 	// Since we'll add a top-level block to unrealircd.conf, need to filter on CONFIG_MAIN lmao
-	if(type != CONFIG_MAIN)
+	if (type != CONFIG_MAIN)
 		return 0; // Returning 0 means idgaf bout dis
 
 	// Check for valid config entries first
-	if(!ce || !ce->name)
+	if (!ce || !ce->name)
 		return 0;
 
 	// If it isn't noservices, idc
-	if(strcmp(ce->name, NO_SERVICES_CONF))
+	if (strcmp(ce->name, NO_SERVICES_CONF))
 		return 0;
 
 	// Loop dat shyte
-	for(cep = ce->items; cep; cep = cep->next) {
+	for (cep = ce->items; cep; cep = cep->next) {
 		// Do we even have a valid name l0l?
-		if(!cep->name)
+		if (!cep->name)
 			continue; // Next iteration imo tbh
 
-		if(!strcmp(cep->name, "api-url")) {
+		if (!strcmp(cep->name, "api-url")) {
 			safe_strdup(cfg.url, cep->value);
 			continue;
 		}
 
-		if(!strcmp(cep->name, "api-key")) {
+		if (!strcmp(cep->name, "api-key")) {
 			safe_strdup(cfg.key, cep->value);
 			continue;
 		}
-		if(!strcmp(cep->name, "account-registration"))
+		if (!strcmp(cep->name, "nick-enforce-timeout")) {
+			cfg.nick_enforce_timeout = config_checkval(cep->value, CFG_TIME);
+			continue;
+		}
+		if (!strcmp(cep->name, "guest-nick")) {
+			safe_strdup(cfg.guest_nick, cep->value);
+			continue;
+		}
+		if (!strcmp(cep->name, "account-registration"))
 		{
-			for(cep2 = cep->items; cep2; cep2 = cep2->next)
+			for (cep2 = cep->items; cep2; cep2 = cep2->next)
 			{
-				if(!cep2->name)
+				if (!cep2->name)
 					continue;
 
-				if(!strcmp(cep2->name, "options"))
+				if (!strcmp(cep2->name, "options"))
 				{
 					for (cep3 = cep2->items; cep3; cep3 = cep3->next)
 					{
-						if(!strcmp(cep3->name, "before-connect"))
+						if (!strcmp(cep3->name, "before-connect"))
 						{
 							cfg.register_before_connect = 1;
 							continue;
 						}
 						
-						if(!strcmp(cep3->name, "custom-account-name"))
+						if (!strcmp(cep3->name, "custom-account-name"))
 						{
 							cfg.register_custom_account = 1;
 							continue;
 						}
 
-						if(!strcmp(cep3->name, "email-required"))
+						if (!strcmp(cep3->name, "email-required"))
 						{
 							cfg.register_email_required = 1;
 							continue;
@@ -1049,14 +1189,15 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 			user_account_login(NULL, client);
 			sendto_server(client, 0, 0, NULL, ":%s SVSLOGIN %s %s %s",
 					me.name, "*", client->id, client->user->account);
-			if (IsUser(client))
-				RunHook(HOOKTYPE_NOSERV_CONNECT_AND_LOGIN, client, result);
+			
 			unreal_log(ULOG_INFO, "login", "ACCOUNT_LOGIN_SUCCESS", NULL,
 					"$client successfully logged into account $account",
 					log_data_string("account", client->user->account),
 					log_data_string("client", !BadPtr(client->name) ? client->name : "A pre-connected user"));
 			if (HasCapability(client, "sasl"))
 				sendto_one(client, NULL, ":%s 903 %s :SASL authentication successful", me.name, account);
+			if (IsUser(client))
+				RunHook(HOOKTYPE_NOSERV_CONNECT_AND_LOGIN, client, result);
 
 		}
 		else if (!success && code && account)
@@ -1681,6 +1822,235 @@ void certfp_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
 
 	else if (client && !success && code && reason)
 		sendto_one(client, NULL, ":%s FAIL CERTFP %s %s :%s", me.name, code, cert, reason);
-	
+
 	json_decref(result);
+}
+
+
+int noservices_hook_post_local_nickchange(Client *client, MessageTag *mtags, const char *oldnick)
+{
+	UnrequireLogin(client);
+	// if they're already logged into that nick it's fine
+	if (IsLoggedIn(client) && !strcasecmp(client->name, client->user->account))
+	{
+		return 0;
+	}
+	json_t *j;
+	char *json_serialized;
+	j = json_object();
+	json_object_set_new(j, "method", json_string_unreal("find"));
+	json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client
+	json_object_set_new(j, "account", json_string_unreal(client->name)); // see if that nick is registered
+	json_serialized = json_dumps(j, JSON_COMPACT);
+	if (!json_serialized)
+	{
+		unreal_log(ULOG_WARNING, "no-services", "POST_LOCAL_NICK_CHANGE", client,
+				"Unable to serialize JSON request. Weird.");
+		json_decref(j);
+		return 0;
+	}
+
+	json_decref(j);
+	query_api("account", json_serialized, "nick_account_enforce");
+	return 0;
+}
+
+void nick_account_enforce(OutgoingWebRequest *request, OutgoingWebResponse *response)
+{
+	json_t *result;
+	json_error_t jerr;
+	Client *client = NULL;
+	if (response->errorbuf || !response->memory)
+	{
+		unreal_log(ULOG_INFO, "no-services", "NICK_ENFORCE", NULL,
+					"Error while trying to check $url: $error",
+					log_data_string("url", request->url),
+					log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
+		return;
+	}
+
+	result = json_loads(response->memory, JSON_REJECT_DUPLICATES, &jerr);
+	if (!result)
+	{
+		unreal_log(ULOG_INFO, "no-services", "NICK_ENFORCE", NULL,
+					"Error while trying to check $url: JSON parse error",
+					log_data_string("url", request->url));
+		return;
+	}
+
+	const char *key;
+	json_t *value;
+	char *type = NULL;
+	char *account = NULL;
+	char *reason = NULL;
+	char *code = NULL;
+	char *cert = NULL;
+	int success = 0;
+	json_object_foreach(result, key, value)
+	{
+		if (!strcasecmp(key, "uid"))
+		{
+			client = find_client(json_string_value(value), NULL);
+		}
+		if (!strcasecmp(key, "type"))
+		{
+			type = strdup(json_string_value(value));
+		}
+		if (!strcasecmp(key, "account"))
+		{
+			account = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "success") || !strcasecmp(key, "error"))
+		{
+			if (!strcasecmp(key, "success"))
+			{
+				success = 1;
+			}
+			reason = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "code"))
+		{
+			code = strdup(json_string_value(value));
+		}
+	}
+	if (client && success && !strcasecmp(account, client->name))
+	{ // if they're still online and have the bad nick
+		sendto_one(client, NULL, ":%s NOTE * LOGIN_REQUIRED %s :You must login to that nick to use it.", me.name, client->name);
+		RequireLogin(client);
+	}
+	// else no problem, they can use it
+	else if (UserRequiresLogin(client))
+		UnrequireLogin(client);
+
+	json_decref(result);
+}
+
+EVENT(nick_enforce)
+{
+	Client *client;
+	TKL *tkl;
+	long long change_by = (long long)TStime() +  random_number(300,1800);
+    list_for_each_entry(client, &lclient_list, lclient_node)
+	{
+		if (UserRequiresLogin(client) && (client->lastnick + cfg.nick_enforce_timeout) < TStime())
+		{
+			if (strcasecmp(client->name, client->user->account))
+			{
+				static char nick[NICKLEN];
+				ircsnprintf(nick, sizeof(nick), "%s%d", cfg.guest_nick, random_number(1111,999999));
+
+				// avoid nick collisions lol
+				Client *lookup;
+				while ((lookup = find_user(nick, NULL)) != NULL)
+				{
+					ircsnprintf(nick, sizeof(nick), "%s%d", cfg.guest_nick, random_number(1111,999999));
+				}
+				char mo[32], exp[32];
+				ircsnprintf(mo, sizeof(mo), "%lld", (long long)TStime());
+				ircsnprintf(exp, sizeof(exp), "%lld",  change_by);
+				
+				const char* tkllayer[10] = {
+					me.name,        /*0  server.name */
+					"+",            /*1  + = X-line add */
+					"Q",            /*2  X-line type  */
+					"H" ,           /*3  user */
+					client->name,        /*4  host */
+					"no-services",   /*5  Who set the ban */
+					exp,            /*6  expire_at; never expire */
+					mo,           /*7  set_at */
+					"You must login to use that nick.",    /*8  default reason */
+					NULL		/*9 Extra NULL element to prevent OOB */
+				};
+				
+				cmd_tkl(&me, NULL, sizeof(tkllayer), tkllayer);
+
+
+				// change their nick to
+				const char *parv[3];
+				parv[0] = me.name;
+				parv[1] = strdup(nick);
+				parv[2] = NULL;
+				
+				do_cmd(client, NULL, "NICK", 2, parv);
+
+				Client *confirm = find_user(nick, NULL);
+				if (!confirm) // unable to change nick due to too many nick changes. troublesome user. kill 'em I reckon
+				{
+					
+					unreal_log(ULOG_INFO, "no-services", "NICK_ENFORCE_KILL", client,
+									"$name!$ident@$host failed to identify too many times.",
+									log_data_string("name", client->name),
+									log_data_string("ident", client->user->username),
+									log_data_string("host", client->user->realhost));
+					dead_socket(client, "Server ended the connection.");
+				}
+				else unreal_log(ULOG_INFO, "no-services", "NICK_ENFORCE", client,
+									"$name!$ident@$host failed to identify in time and has had their nick changed to be $nick",
+									log_data_string("name", client->name),
+									log_data_string("ident", client->user->username),
+									log_data_string("host", client->user->realhost),
+									log_data_string("nick", nick));
+			}
+			if (client)
+				UnrequireLogin(client);
+		}
+	}
+}
+
+CMD_FUNC(cmd_release)
+{
+	if (!IsLoggedIn(client))
+	{
+		sendto_one(client, NULL, ":%s FAIL RELEASE NOT_LOGGED_IN :You are not logged in.", me.name);
+		return;
+	}
+
+
+	TKL *nameban;
+	nameban = find_tkl_nameban(TKL_NAME | TKL_GLOBAL, client->user->account, 1);
+	if (!nameban)
+	{
+		sendto_one(client, NULL, ":%s FAIL RELEASE ACCOUNT_NOT_HELD :That account name is not on hold.", me.name);
+		return;
+	}
+	sendnotice_tkl_del(client->name, nameban);
+	
+	sendto_server(NULL, 0, 0, NULL, ":%s TKL %c %c %c %s %s %lld %lld :%s", client->name,
+			'-',
+			TKL_NAME | TKL_GLOBAL,
+			nameban->ptr.nameban->hold ? 'H' : '*',
+			nameban->ptr.nameban->name,
+			nameban->set_by,
+			(long long)nameban->expire_at, (long long)nameban->set_at,
+			nameban->ptr.nameban->reason);
+	tkl_del_line(nameban);
+	sendto_one(client, NULL, ":%s RELEASE SUCCESS ACCOUNT_RELEASED :Nick \"%s\" has been released. You may now use the nick.", me.name, client->user->account);
+	
+}
+
+/** THIS IS UNFINISHED, DO NOT USE DROP, YOU MAY EXPERIENCE BUGS */
+CMD_FUNC(cmd_drop)
+{
+	Client *target;
+	if (!IsLoggedIn(client) && !IsOper(client))
+	{
+		sendto_one(client, NULL, ":%s FAIL DROP NOT_LOGGED_IN :You are not logged in.", me.name);
+		return;
+	}
+	if (IsOper(client) && !BadPtr(parv[1]))
+	{
+		target = find_user(parv[1], NULL);
+		if (ValidatePermissionsForPath("no-services:account:drop", client, NULL, NULL, NULL))
+		{
+			sendnotice(client, "DROPPED LMAO %s", parv[1]);
+		}
+		else if (target != client)
+		{
+			sendto_one(client, NULL, ":%s FAIL DROP NO_PERMISSION :You do not have permission to drop accounts.", me.name);
+			return;
+		}
+	}
+	else target = client;
+
+	sendnotice(target, "Your account has been DROPPED lmao");
 }
