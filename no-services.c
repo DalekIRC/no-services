@@ -2,7 +2,7 @@
   Licence: GPLv3
   Copyright Ⓒ 2024 Valerie Pond
   */
-#define NOSERVICES_VERSION "1.2.3.4"
+#define NOSERVICES_VERSION "1.2.3.4.5"
 
 /*** <<<MODULE MANAGER START>>>
 module
@@ -63,6 +63,8 @@ module
  *
  *	For an actual example, see `void do_ajoin(){...}`
  */
+
+int set_user_password(Client *client, Client *oper, const char *password);
 void hooktype_noserv_connect_and_login(Client *client, json_t *result);
 // sasl stuff
 #define SASL_TYPE_NONE 0
@@ -80,16 +82,23 @@ ModDataInfo *sasl_md;
 ModDataInfo *need_login;
 
 // nick drop key
-#define GetDropKey(x)			(moddata_client_get(x, "need_login"))
-#define WantsToDrop(x, y)		do { moddata_client_set(x, "need_login", y); } while (0)
-#define NoLongerWantsToDrop(x)		do { moddata_client_set(x, "need_login"	, "0"); } while (0)
-ModDataInfo *need_login;
+#define WantsToDrop(x)		do { moddata_client_set(x, need_drop, "1"); } while (0)
+#define NoLongerWantsToDrop(x)	do { moddata_client(x, need_drop, "0"); } while (0)
+ModDataInfo *need_drop;
+
+// nick drop key
+#define GetDropKey(x)			(moddata_client(x, drop_key_md).i)
+#define SetDropKey(x, y)		do { moddata_client(x, drop_key_md).i = y; } while(0)
+#define UnsetDropKey(x)			do { moddata_client(x, drop_key_md).i = 0; } while(0)
+ModDataInfo *drop_key_md;
 
 void setcfg(void);
 void freecfg(void);
 int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs);
 int noservices_configrun(ConfigFile *cf, ConfigEntry *ce, int type);
+
 void connect_query_user(Client *client);
+void account_enforce_check(Client *client);
 
 long CAP_ACCOUNTREGISTRATION = 0L;
 long CAP_SASL_OVR = 0L;
@@ -104,11 +113,24 @@ void ajoin_callback(OutgoingWebRequest *request, OutgoingWebResponse *response);
 void connect_query_user_response(OutgoingWebRequest *request, OutgoingWebResponse *response);
 void certfp_callback(OutgoingWebRequest *request, OutgoingWebResponse *response);
 void nick_account_enforce(OutgoingWebRequest *request, OutgoingWebResponse *response);
+void nick_setpassword_callback(OutgoingWebRequest *request, OutgoingWebResponse *response);
+void nick_account_drop(OutgoingWebRequest *request, OutgoingWebResponse *response);
 
 // draft/account-registration= parameter MD
 void regkeylist_free(ModData *m);
 const char *regkeylist_serialize(ModData *m);
 void regkeylist_unserialize(const char *str, ModData *m);
+
+
+// If someone wants to drop their nick
+void wtdrop_free(ModData *m);
+const char *wtdrop_serialize(ModData *m);
+void wtdrop_unserialize(const char *str, ModData *m);
+
+// A key if someone wants to drop their account
+void dropkey_free(ModData *m);
+const char *dropkey_serialize(ModData *m);
+void dropkey_unserialize(const char *str, ModData *m);
 
 // Who's SASLing how
 void sat_free(ModData *m);
@@ -124,6 +146,7 @@ int noservices_hook_local_connect(Client *client);
 int noservices_hook_post_local_nickchange(Client *client, MessageTag *mtags, const char *oldnick);
 
 void do_ajoin(Client *client, json_t *result);
+void do_account_drop(Client *client);
 
 int sasl_capability_visible(Client *client);
 const char *sasl_capability_parameter(Client *client);
@@ -134,15 +157,17 @@ CMD_FUNC(cmd_login);
 CMD_OVERRIDE_FUNC(cmd_authenticate_ovr);
 CMD_FUNC(cmd_ajoin);
 CMD_FUNC(cmd_logout);
+CMD_FUNC(cmd_salogout);
 CMD_FUNC(cmd_certfp);
 CMD_FUNC(cmd_release);
 CMD_FUNC(cmd_drop);
+CMD_FUNC(cmd_setpassword);
+CMD_FUNC(cmd_sadrop);
 
 EVENT(nick_enforce);
 int random_number(int low, int high)
 {
 	int number = rand() % ((high+1) - low) + low;
- 
 	return number;
 }
 /* Config struct*/
@@ -162,7 +187,6 @@ struct cfgstruct {
 	int register_email_required;
 	int password_strength_requirement;
 	
-	// sasl
 	long nick_enforce_timeout;
 	char *guest_nick;
 
@@ -300,6 +324,31 @@ MOD_INIT()
 	}
 	
 	memset(&mreq, 0, sizeof(mreq));
+	mreq.name = "wants_to_drop_nick";
+	mreq.free = wtdrop_free;
+	mreq.serialize = wtdrop_serialize;
+	mreq.unserialize = wtdrop_unserialize;
+	mreq.type = MODDATATYPE_CLIENT;
+	if (!(need_drop = ModDataAdd(modinfo->handle, mreq)))
+	{
+		config_error("Could not add ModData for account dropping.");
+		return MOD_FAILED;
+	}
+	
+	memset(&mreq, 0, sizeof(mreq));
+	mreq.name = "drop_key_md";
+	mreq.free = dropkey_free;
+	mreq.serialize = dropkey_serialize;
+	mreq.unserialize = dropkey_unserialize;
+	mreq.type = MODDATATYPE_CLIENT;
+	if (!(drop_key_md = ModDataAdd(modinfo->handle, mreq)))
+	{
+		config_error("Could not add ModData for account dropping.");
+		return MOD_FAILED;
+	}
+	
+
+	memset(&mreq, 0, sizeof(mreq));
 	mreq.name = "sasl_auth_type";
 	mreq.free = sat_free;
 	mreq.serialize = sat_serialize;
@@ -339,6 +388,8 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_CONNECT, 9999, noservices_hook_local_connect); // we want to be called after auto-oper and such
 	HookAdd(modinfo->handle, HOOKTYPE_POST_LOCAL_NICKCHANGE, 0, noservices_hook_post_local_nickchange);
 	HookAddVoid(modinfo->handle, HOOKTYPE_NOSERV_CONNECT_AND_LOGIN, 0, do_ajoin); // custom hook baby
+
+	/** Our API callback hooks */
 	RegisterApiCallbackWebResponse(modinfo->handle, "register_account", register_account);
 	RegisterApiCallbackWebResponse(modinfo->handle, "register_channel", register_channel);
 	RegisterApiCallbackWebResponse(modinfo->handle, "ns_account_login", ns_account_login);
@@ -346,15 +397,23 @@ MOD_INIT()
 	RegisterApiCallbackWebResponse(modinfo->handle, "certfp_callback", certfp_callback);
 	RegisterApiCallbackWebResponse(modinfo->handle, "connect_query_user_response", connect_query_user_response);
 	RegisterApiCallbackWebResponse(modinfo->handle, "nick_account_enforce", nick_account_enforce);
+	RegisterApiCallbackWebResponse(modinfo->handle, "nick_setpassword_callback", nick_setpassword_callback);
+	RegisterApiCallbackWebResponse(modinfo->handle, "nick_account_drop", nick_account_drop);
+
+	/** The commands that we are so nice as to add to the IRCd =] */
 	CommandOverrideAdd(modinfo->handle, "AUTHENTICATE", 0, cmd_authenticate_ovr);
 	CommandAdd(modinfo->handle, "REGISTER", cmd_register, 3, CMD_USER | CMD_UNREGISTERED);
 	CommandAdd(modinfo->handle, "CREGISTER", cmd_cregister, 3, CMD_USER);
 	CommandAdd(modinfo->handle, "LOGIN", cmd_login, 3, CMD_USER);
-	CommandAdd(modinfo->handle, "LOGOUT", cmd_logout, MAXPARA, CMD_USER);
+	CommandAdd(modinfo->handle, "LOGOUT", cmd_logout, 0, CMD_USER);
+	CommandAdd(modinfo->handle, "SALOGOUT", cmd_salogout, 1, CMD_OPER);
 	CommandAdd(modinfo->handle, "AJOIN", cmd_ajoin, MAXPARA, CMD_USER);
 	CommandAdd(modinfo->handle, "CERTFP", cmd_certfp, 2, CMD_USER);
 	CommandAdd(modinfo->handle, "RELEASE", cmd_release, 2, CMD_USER);
-	CommandAdd(modinfo->handle, "DROP", cmd_drop, 2, CMD_USER);
+	CommandAdd(modinfo->handle, "DROP", cmd_drop, 1, CMD_USER);
+	CommandAdd(modinfo->handle, "SADROP", cmd_sadrop, 2, CMD_OPER);
+	CommandAdd(modinfo->handle, "SETPASSWORD", cmd_setpassword, 2, CMD_USER);
+	
 	EventAdd(modinfo->handle, "nick_enforce", nick_enforce, NULL, 1000, 0);
 
 	// Here, we take control of SASL but don't unload the original module because we
@@ -364,12 +423,14 @@ MOD_INIT()
 	ClientCapabilityDel(clicap);
 
 	// and put our own version
+	unreal_log(ULOG_INFO, "module", "LOAD_CLICAP", NULL, "Replace with no-services 'sasl'.");
 	ClientCapabilityInfo cap;
 	memset(&cap, 0, sizeof(cap));
 	cap.name = "sasl";
 	cap.visible = sasl_capability_visible;
 	cap.parameter = sasl_capability_parameter;
-	ClientCapabilityAdd(modinfo->handle, &cap, &CAP_SASL_OVR);
+	if (!(ClientCapabilityAdd(modinfo->handle, &cap, &CAP_SASL_OVR)))
+		return MOD_FAILED;
 
 	return MOD_SUCCESS;
 }
@@ -523,7 +584,7 @@ CMD_FUNC(cmd_register)
 		return;
     }
 
-	// protect against registering serv names lol
+	/* protect against registering serv names lol
     const char *target = "serv";
     int match = 1;
     // Compare the last 4 characters
@@ -537,11 +598,12 @@ CMD_FUNC(cmd_register)
 			break;
         }
     }
+	
 	if (match)
 	{
 		sendto_one(client, NULL, ":%s FAIL REGISTER BANNED_NICK %s :You may not register that nick.", me.name, parv[1]);
 		return;
-	}
+	}*/
 	if (BadPtr(cfg.url) || BadPtr(cfg.key)) // no api set? no registration
 	{
 		sendto_one(client, NULL, ":%s FAIL REGISTER TEMPORARILY_UNAVAILABLE %s :Registration has not been configured on this server.", me.name, parv[1]);
@@ -789,6 +851,41 @@ const char *regkeylist_serialize(ModData *m)
 }
 
 void regkeylist_unserialize(const char *str, ModData *m)
+{
+	safe_strdup(m->str, str);
+}
+
+
+void wtdrop_free(ModData *m)
+{
+	safe_free(m->str);
+}
+
+const char *wtdrop_serialize(ModData *m)
+{
+	if (!m->str)
+		return NULL;
+	return m->str;
+}
+
+void wtdrop_unserialize(const char *str, ModData *m)
+{
+	safe_strdup(m->str, str);
+}
+
+void dropkey_free(ModData *m)
+{
+	safe_free(m->str);
+}
+
+const char *dropkey_serialize(ModData *m)
+{
+	if (!m->str)
+		return NULL;
+	return m->str;
+}
+
+void dropkey_unserialize(const char *str, ModData *m)
 {
 	safe_strdup(m->str, str);
 }
@@ -1185,6 +1282,7 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 		// yay they registered
 		if (success)
 		{
+			UnsetDropKey(client);
 			strlcpy(client->user->account, account, sizeof(client->user->account));
 			user_account_login(NULL, client);
 			sendto_server(client, 0, 0, NULL, ":%s SVSLOGIN %s %s %s",
@@ -1297,6 +1395,7 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 		if (n <= 1)
 		{
 			json_decref(j);
+			DelSaslType(client);
 			return;
 		}
 		char *segments[3] = { NULL }; // Array to store segments
@@ -1314,6 +1413,7 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 		if (segmentIndex != 3)
 		{
 			json_decref(j);
+			DelSaslType(client);
 			return;
 		}
 		safe_strdup(account, segments[1]); // Assign the second segment to account
@@ -1328,6 +1428,7 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 		json_serialized = json_dumps(j, JSON_COMPACT);
 		if (!json_serialized)
 		{
+			DelSaslType(client);
 			unreal_log(ULOG_WARNING, "login", "BUG_SEREALIZE", client,
 					"Unable to serialize JSON request. Weird.");
 			json_decref(j);
@@ -1337,6 +1438,7 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 		query_api("account", json_serialized, "ns_account_login");
 		safe_free(account);
 		safe_free(password);
+		DelSaslType(client);
 	}
 	else if (GetSaslType(client) == SASL_TYPE_EXTERNAL)
 	{
@@ -1346,7 +1448,8 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 		if (!moddata || !moddata_client(client, moddata).str)
 		{
 			json_decref(j);
-			sendto_one(client, NULL, ":%s FAIL CERTFP NO_CERT :You don't have a Certificate Fingerprint to add.", me.name);
+			sendto_one(client, NULL, ":%s FAIL AUTHENTICATE NO_CERT :You don't have a Certificate Fingerprint to authenticate with.", me.name);
+			DelSaslType(client);
 			return;
 		}
 		json_object_set_new(j, "method", json_string_unreal("identify cert")); // we would like to register plz
@@ -1356,6 +1459,8 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 		json_serialized = json_dumps(j, JSON_COMPACT);
 		if (!json_serialized)
 		{
+
+			DelSaslType(client);
 			unreal_log(ULOG_WARNING, "login", "BUG_SEREALIZE", client,
 					"Unable to serialize JSON request. Weird.");
 			json_decref(j);
@@ -1552,11 +1657,19 @@ CMD_FUNC(cmd_logout)
 	sendto_server(client, 0, 0, NULL, ":%s SVSLOGIN * %s 0", me.id, client->name);
 }
 
+CMD_FUNC(cmd_salogout)
+{
+
+
+}
 
 int noservices_hook_local_connect(Client *client)
 {
 	if (!IsLoggedIn(client))
+	{
+		account_enforce_check(client);
 		return 0;
+	}
 	connect_query_user(client);
 	return 0;
 }
@@ -1579,8 +1692,8 @@ void connect_query_user(Client *client)
 	}
 
 	json_decref(j);
-	query_api("account", json_serialized, "connect_query_user_response");
 	add_fake_lag(client, 1000);
+	query_api("account", json_serialized, "connect_query_user_response");
 	return;
 }
 
@@ -1835,6 +1948,12 @@ int noservices_hook_post_local_nickchange(Client *client, MessageTag *mtags, con
 	{
 		return 0;
 	}
+	account_enforce_check(client);
+	return 0;
+}
+
+void account_enforce_check(Client *client)
+{
 	json_t *j;
 	char *json_serialized;
 	j = json_object();
@@ -1847,12 +1966,11 @@ int noservices_hook_post_local_nickchange(Client *client, MessageTag *mtags, con
 		unreal_log(ULOG_WARNING, "no-services", "POST_LOCAL_NICK_CHANGE", client,
 				"Unable to serialize JSON request. Weird.");
 		json_decref(j);
-		return 0;
+		return;
 	}
 
 	json_decref(j);
 	query_api("account", json_serialized, "nick_account_enforce");
-	return 0;
 }
 
 void nick_account_enforce(OutgoingWebRequest *request, OutgoingWebResponse *response)
@@ -2028,29 +2146,201 @@ CMD_FUNC(cmd_release)
 	
 }
 
-/** THIS IS UNFINISHED, DO NOT USE DROP, YOU MAY EXPERIENCE BUGS */
+
 CMD_FUNC(cmd_drop)
 {
-	Client *target;
-	if (!IsLoggedIn(client) && !IsOper(client))
+	if (!IsLoggedIn(client))
 	{
 		sendto_one(client, NULL, ":%s FAIL DROP NOT_LOGGED_IN :You are not logged in.", me.name);
 		return;
 	}
-	if (IsOper(client) && !BadPtr(parv[1]))
+	if (!(GetDropKey(client)))
 	{
-		target = find_user(parv[1], NULL);
-		if (ValidatePermissionsForPath("no-services:account:drop", client, NULL, NULL, NULL))
+		SetDropKey(client, random_number(10000,99999));
+		sendto_one(client, NULL, ":%s DROP * VERIFICATION_NEEDED %s :Please verify that you want to drop your account. This will delete your account and data. If you really want to do that, please type /drop %d", me.name, client->user->account, GetDropKey(client));
+		return;
+	}
+	else if (!BadPtr(parv[1]))
+	{
+		const char *token = strdup(my_itoa(GetDropKey(client)));
+		if (!strcmp(parv[1], token))
 		{
-			sendnotice(client, "DROPPED LMAO %s", parv[1]);
-		}
-		else if (target != client)
-		{
-			sendto_one(client, NULL, ":%s FAIL DROP NO_PERMISSION :You do not have permission to drop accounts.", me.name);
+			UnsetDropKey(client);
+			do_account_drop(client);
 			return;
 		}
 	}
-	else target = client;
+	sendto_one(client, NULL, ":%s DROP * INCORRECT_CODE %s :The code you entered was incorrect.", me.name, client->user->account);	
+}
 
-	sendnotice(target, "Your account has been DROPPED lmao");
+
+CMD_FUNC(cmd_sadrop)
+{
+
+
+}
+
+void do_account_drop(Client *client)
+{
+	const char *account = strdup(client->user->account);
+	// why would we do it if they're not logged in? we checked earlier but..
+	if (!IsLoggedIn(client))
+		return;
+	
+	json_t *j;
+	char *json_serialized;
+	j = json_object();
+	json_object_set_new(j, "method", json_string_unreal("drop"));
+	json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client
+	json_object_set_new(j, "account", json_string_unreal(client->user->account)); // see if that nick is registered
+	json_serialized = json_dumps(j, JSON_COMPACT);
+	if (!json_serialized)
+	{
+		unreal_log(ULOG_WARNING, "no-services", "POST_LOCAL_NICK_CHANGE", client,
+				"Unable to serialize JSON request. Weird.");
+		json_decref(j);
+		return;
+	}
+
+	json_decref(j);
+	query_api("account", json_serialized, "nick_account_drop");
+}
+
+
+CMD_FUNC(cmd_setpassword)
+{
+	if (!IsLoggedIn(client) && !IsOper(client))
+	{
+		sendto_one(client, NULL, ":%s FAIL SETPASSWORD NOT_LOGGED_IN :You are not logged in.", me.name);
+		return;
+	}
+	
+}
+
+
+int set_user_password(Client *client, Client *oper, const char *password)
+{
+	json_t *j;
+	char *json_serialized;
+	j = json_object();
+	json_object_set_new(j, "method", json_string_unreal("set password"));
+	json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client
+	json_object_set_new(j, "account", json_string_unreal(client->user->account)); // see if that nick is registered
+	json_serialized = json_dumps(j, JSON_COMPACT);
+	if (!json_serialized)
+	{
+		unreal_log(ULOG_WARNING, "no-services", "SETPASSWORD", client,
+				"Unable to serialize JSON request. Weird.");
+		json_decref(j);
+		return 0;
+	}
+	if (oper)
+		unreal_log(ULOG_INFO, "no-services", "CHGPASSWORD", client,
+				"The password for account \"$account\" has been updated by oper $name ($opername)",
+				log_data_string("account", client->user->account),
+				log_data_string("name", oper->name),
+				log_data_string("opername", oper->user->operlogin)
+			);
+	else
+		unreal_log(ULOG_INFO, "no-services", "SETPASSWORD", client,
+				"The password for account \"$account\" has been updated by the account owner ($client.details).",
+				log_data_string("account", client->user->account),
+				log_data_string("nick", client->name)
+			);
+	json_decref(j);
+	query_api("account", json_serialized, "nick_setpassword_callback");
+	return 1;
+}
+
+
+void nick_setpassword_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
+{
+
+}
+
+void nick_account_drop(OutgoingWebRequest *request, OutgoingWebResponse *response)
+{
+	json_t *result;
+	json_error_t jerr;
+	Client *client = NULL;
+	if (response->errorbuf || !response->memory)
+	{
+		unreal_log(ULOG_INFO, "no-services", "ACCOUNT_DROP", NULL,
+					"Error while trying to check $url: $error",
+					log_data_string("url", request->url),
+					log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
+		return;
+	}
+
+	result = json_loads(response->memory, JSON_REJECT_DUPLICATES, &jerr);
+	if (!result)
+	{
+		unreal_log(ULOG_INFO, "no-services", "ACCOUNT_DROP", NULL,
+					"Error while trying to check $url: JSON parse error",
+					log_data_string("url", request->url));
+		return;
+	}
+
+	const char *key;
+	json_t *value;
+	char *account = NULL;
+	char *reason = NULL;
+	char *code = NULL;
+	int success = 0;
+	json_object_foreach(result, key, value)
+	{
+		if (!strcasecmp(key, "uid"))
+		{
+			client = find_client(json_string_value(value), NULL);
+		}
+		if (!strcasecmp(key, "account"))
+		{
+			account = strdup(json_string_value(value));
+		}
+		if (!strcasecmp(key, "code"))
+		{
+			code = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "success") || !strcasecmp(key, "error"))
+		{
+			if (!strcasecmp(key, "success"))
+			{
+				success = 1;
+			}
+			reason = strdup(json_string_value(value));
+		}
+	}
+	if (success && client && account) // check all the clients everywhere and log them out if nessicelery
+	{
+		Client *cli_list;
+		list_for_each_entry(cli_list, &client_list, client_node)
+		{
+			if (!IsUser(cli_list) || !IsLoggedIn(cli_list)) // if they're not logged in then skippem
+				continue;
+			if (strcasecmp(account, cli_list->user->account) != 0)
+				continue;
+
+			if (MyUser(cli_list))
+			{
+				sendto_one(cli_list, NULL, ":%s NOTE * ACCOUNT_DROPPED %s :You have been logged out because this account (%s) has been dropped by %s!%s@%s",
+										me.name, account, account, client->name, client->user->username, client->user->realhost);
+				strlcpy(cli_list->user->account, "0", sizeof(cli_list->user->account));
+				user_account_login(NULL, cli_list);
+
+			} else {
+				sendto_one(cli_list, NULL, ":%s SREPLY %s %s * %s %s :You have been logged out because this account (%s) has been dropped by %s!%s@%s",
+						me.name, cli_list->id, "N", "ACCOUNT_DROPPED", account, account, client->name, client->user->username, client->user->realhost);
+			}
+		
+
+			sendto_server(NULL, 0, 0, NULL, ":%s SVSLOGIN %s %s %s",
+						me.name, "*", cli_list->id, "0");
+		}
+	}
+	else if (!success && client && reason)
+	{
+		sendto_one(client, NULL, ":%s FAIL DROP %s :Unable to drop account: %s.", me.name, code, reason);
+	}
+
+	json_decref(result);
 }
