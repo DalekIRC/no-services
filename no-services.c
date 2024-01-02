@@ -2,7 +2,7 @@
   Licence: GPLv3
   Copyright Ⓒ 2024 Valerie Pond
   */
-#define NOSERVICES_VERSION "1.2.3.4.5"
+#define NOSERVICES_VERSION "1.2.4"
 
 /*** <<<MODULE MANAGER START>>>
 module
@@ -309,7 +309,7 @@ static char *ajoin_help[] = {
 	"Note: You must actually be in the channel you want to add to",
 	"your auto-join list.",
 	"You can type the command in either upper or lower-case, but ",
-	"the examples below use upper-case for the purposes of",
+	"the examples below use upper-case for the purposes of this example",
 	"-",
 	"Syntax:",
 	"    /AJOIN <add|del|list> [<channel>]",
@@ -355,7 +355,7 @@ MOD_INIT()
 	mreq.type = MODDATATYPE_CLIENT;
 	if (!ModDataAdd(modinfo->handle, mreq))
 	{
-		config_error("Could not add ModData for regkeylist");
+		config_error("Could not add ModData for regkeylist. Please contact developer.");
 		return MOD_FAILED;
 	}
 	
@@ -367,7 +367,7 @@ MOD_INIT()
 	mreq.type = MODDATATYPE_CLIENT;
 	if (!(need_drop = ModDataAdd(modinfo->handle, mreq)))
 	{
-		config_error("Could not add ModData for account dropping.");
+		config_error("Could not add ModData for account dropping. Please contact developer.");
 		return MOD_FAILED;
 	}
 	
@@ -379,7 +379,7 @@ MOD_INIT()
 	mreq.type = MODDATATYPE_CLIENT;
 	if (!(drop_key_md = ModDataAdd(modinfo->handle, mreq)))
 	{
-		config_error("Could not add ModData for account dropping.");
+		config_error("Could not add ModData for account dropping. Please contact developer.");
 		return MOD_FAILED;
 	}
 	
@@ -392,7 +392,7 @@ MOD_INIT()
 	mreq.type = MODDATATYPE_CLIENT;
 	if (!(sasl_md = ModDataAdd(modinfo->handle, mreq)))
 	{
-		config_error("Could not add ModData for sasl_auth_type");
+		config_error("Could not add ModData for sasl_auth_type. Please contact developer.");
 		return MOD_FAILED;
 	}
 	
@@ -404,7 +404,7 @@ MOD_INIT()
 	mreq.type = MODDATATYPE_CLIENT;
 	if (!(need_login = ModDataAdd(modinfo->handle, mreq)))
 	{
-		config_error("Could not add ModData for sasl_auth_type");
+		config_error("Could not add ModData for need_login. Please contact developer.");
 		return MOD_FAILED;
 	}
 	/** Account Registration cap `draft/account-registration`
@@ -1314,7 +1314,7 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 		{
 			code = strdup(json_string_value(value));
 		}
-		else if (!strcasecmp(key, "account"))
+		else if (success && !strcasecmp(key, "account"))
 		{
 			account = strdup(json_string_value(value));
 		}
