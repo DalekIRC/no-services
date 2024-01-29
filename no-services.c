@@ -15,7 +15,7 @@ module
 				"The module is installed. Now all you need to do is add a loadmodule line:";
 				"loadmodule \"third/no-services\";";
 				"And /REHASH the IRCd.";
-				"The module does not need any other configuration.";
+				"Please see the README for configuration..";
 		}
 }
 *** <<<MODULE MANAGER END>>>
@@ -124,7 +124,6 @@ void regkeylist_free(ModData *m);
 const char *regkeylist_serialize(ModData *m);
 void regkeylist_unserialize(const char *str, ModData *m);
 
-
 // If someone wants to drop their nick
 void wtdrop_free(ModData *m);
 const char *wtdrop_serialize(ModData *m);
@@ -154,9 +153,11 @@ void do_account_drop(const char *account, const char *callback_uid);
 int sasl_capability_visible(Client *client);
 const char *sasl_capability_parameter(Client *client);
 
+CMD_OVERRIDE_FUNC(cmd_authenticate_ovr);
+CMD_OVERRIDE_FUNC(cmd_nick_ovr);
+CMD_OVERRIDE_FUNC(cmd_privmsg_ovr);
 CMD_FUNC(cmd_register);
 CMD_FUNC(cmd_cregister);
-CMD_OVERRIDE_FUNC(cmd_authenticate_ovr);
 CMD_FUNC(cmd_ajoin);
 CMD_FUNC(cmd_login);
 CMD_FUNC(cmd_logout);
@@ -166,6 +167,10 @@ CMD_FUNC(cmd_release);
 CMD_FUNC(cmd_drop);
 CMD_FUNC(cmd_setpassword);
 CMD_FUNC(cmd_sadrop);
+CMD_FUNC(cmd_tban);
+CMD_FUNC(cmd_bot);
+
+
 
 EVENT(nick_enforce);
 
@@ -174,6 +179,199 @@ int random_number(int low, int high)
 	int number = rand() % ((high+1) - low) + low;
 	return number;
 }
+
+char* uppercaseString(const char* input) {
+    size_t length = strlen(input);
+    
+    // Allocate memory for the new string
+    char* result = (char*)malloc(length + 1);
+    if (result == NULL) {
+        // Handle memory allocation error
+        exit(EXIT_FAILURE);
+    }
+
+    // Copy the input string and convert each character to uppercase
+    for (size_t i = 0; i < length; ++i) {
+        result[i] = toupper(input[i]);
+    }
+
+    // Null-terminate the new string
+    result[length] = '\0';
+
+    return result;
+}
+
+/* These are two local (static) buffers used by the various send functions */
+static char sendbuf[MAXLINELENGTH];
+static char sendbuf2[MAXLINELENGTH];
+/** Send a message to a single client - va_list variant.
+ * This function is similar to sendto_one() except that it
+ * doesn't use varargs but uses a va_list instead.
+ * Generally this function is NOT used outside send.c, so not by modules.
+ * @param to		The client to send to
+ * @param mtags		Any message tags associated with this message (can be NULL)
+ * @param pattern	The format string / pattern to use.
+ * @param vl		Format string parameters.
+ */
+void vsendto_one(Client *to, MessageTag *mtags, const char *pattern, va_list vl)
+{
+	const char *mtags_str = mtags ? mtags_to_string(mtags, to) : NULL;
+
+	/* Need to ignore -Wformat-nonliteral here */
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
+	ircvsnprintf(sendbuf, sizeof(sendbuf)-3, pattern, vl);
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+	if (BadPtr(mtags_str))
+	{
+		/* Simple message without message tags */
+		sendbufto_one(to, sendbuf, 0);
+	} else {
+		/* Message tags need to be prepended */
+		snprintf(sendbuf2, sizeof(sendbuf2)-3, "@%s %s", mtags_str, sendbuf);
+		sendbufto_one(to, sendbuf2, 0);
+	}
+}
+
+typedef struct BotCommand BotCommand;
+
+struct BotCommand {
+	char command[50];
+	char helptext[250];
+	struct BotCommand *prev, *next;
+};
+
+// Function to create a new bot command node
+BotCommand* create_bot_command(const char* command, const char* helptext) {
+	BotCommand* newCommand = (BotCommand*)malloc(sizeof(BotCommand));
+	if (newCommand == NULL) {
+		// Handle memory allocation failure
+		exit(EXIT_FAILURE);
+	}
+	strcpy(newCommand->command, command);
+	strcpy(newCommand->helptext, helptext);
+	newCommand->prev = NULL;
+	newCommand->next = NULL;
+	return newCommand;
+}
+
+// Function to insert a new bot command at the beginning of the doubly-linked list
+BotCommand* insert_bot_command(BotCommand* head, const char* command, const char* helptext) {
+	BotCommand* newCommand = create_bot_command(command, helptext);
+	newCommand->next = head;
+	if (head != NULL) {
+		head->prev = newCommand;
+	}
+	return newCommand;
+}
+
+// Function to display all bot commands in the doubly-linked list
+void displayBotCommands(BotCommand* head) {
+	BotCommand* current = head;
+	while (current != NULL) {
+		printf("Command: %s\n", current->command);
+		printf("HelpText: %s\n", current->helptext);
+		printf("\n");
+		current = current->next;
+	}
+}
+
+
+// Function to handle bot commands received from IRC
+void handle_bot_command(const char* botName, const char* command) {
+	// You can implement logic here to process the bot command
+	printf("Bot %s received command: %s\n", botName, command);
+}
+
+// Function to free the memory allocated for the doubly-linked list
+void free_bot_commands(BotCommand* head) {
+	BotCommand* current = head;
+	while (current != NULL) {
+		BotCommand* next = current->next;
+		free(current);
+		current = next;
+	}
+}
+
+// Function to delete a specific bot command from the doubly-linked list
+BotCommand* delete_bot_command(BotCommand* head, const char* commandToDelete) {
+	BotCommand* current = head;
+
+	// Search for the command to delete
+	while (current != NULL) {
+		if (strcmp(current->command, commandToDelete) == 0) {
+			if (current->prev != NULL) {
+				current->prev->next = current->next;
+			} else {
+				// Deleting the first node, update head
+				head = current->next;
+			}
+
+			if (current->next != NULL) {
+				current->next->prev = current->prev;
+			}
+
+			free(current);
+			break;
+		}
+
+		current = current->next;
+	}
+
+	return head;  // Return the updated head of the list
+}
+
+typedef struct Bot Bot;
+
+struct Bot {
+	char name[NICKLEN + 1];
+	BotCommand *cmdslist;
+	MultiLine *helptext;
+	struct Bot *prev, *next;
+};
+
+// Function to add a new command to a bot
+void add_command_to_bot(Bot* bot, const char* command, const char* helpText) {
+	BotCommand* newCommand = (BotCommand*)malloc(sizeof(BotCommand));
+	if (newCommand == NULL) {
+		// Handle memory allocation error
+		exit(EXIT_FAILURE);
+	}
+
+	strncpy(newCommand->command, uppercaseString(command), sizeof(newCommand->command));
+	strncpy(newCommand->helptext, helpText, sizeof(newCommand->helptext));
+
+	newCommand->next = bot->cmdslist;
+	bot->cmdslist = newCommand;
+}
+
+// Function to remove a command from a bot
+void remove_command_from_bot(Bot* bot, const char* command) {
+	BotCommand* current = bot->cmdslist;
+	BotCommand* prev = NULL;
+
+	while (current != NULL) {
+		if (strcmp(current->command, command) == 0) {
+			if (prev == NULL) {
+				bot->cmdslist = current->next;
+			} else {
+				prev->next = current->next;
+			}
+
+			free(current);
+			return;
+		}
+
+		prev = current;
+		current = current->next;
+	}
+}
+
 /* Config struct*/
 struct cfgstruct {
 	char *url;
@@ -194,9 +392,96 @@ struct cfgstruct {
 	long nick_enforce_timeout;
 	char *guest_nick;
 
+	Bot *bot_node; // head of linked list
 };
 
 static struct cfgstruct cfg;
+
+void bot_sendnotice(Bot *from, Client *target, FORMAT_STRING(const char *pattern), ...)
+{
+	va_list vl;
+	
+	char buffer[512];
+
+	// Use snprintf to modify the string in the buffer
+	snprintf(buffer, sizeof(buffer), ":%s!%s@%s NOTICE %s :%s", from->name, from->name, me.name, target->name, pattern);
+
+	// Use the same buffer for the new const char*
+	const char* newString = buffer;
+
+	va_start(vl, pattern);
+	vsendto_one(target, NULL, newString, vl);
+	va_end(vl);
+}
+
+Bot *AddBot(const char *name) {
+	Bot *newBot = (Bot *)malloc(sizeof(Bot));
+	if (newBot != NULL) {
+		strncpy(newBot->name, name, NICKLEN);
+		newBot->cmdslist = NULL;
+		newBot->next = cfg.bot_node;
+		newBot->prev = NULL;
+
+		if (cfg.bot_node != NULL) {
+			cfg.bot_node->prev = newBot;
+		}
+
+		cfg.bot_node = newBot;
+	}
+	return newBot;
+}
+
+void DelBot(const char *name) {
+	Bot *currentBot = cfg.bot_node;
+
+	while (currentBot != NULL) {
+		if (strcasecmp(currentBot->name, name) == 0) {
+			if (currentBot->prev != NULL) {
+				currentBot->prev->next = currentBot->next;
+			} else {
+				cfg.bot_node = currentBot->next;
+			}
+
+			if (currentBot->next != NULL) {
+				currentBot->next->prev = currentBot->prev;
+			}
+
+			free(currentBot);
+			break;
+		}
+
+		currentBot = currentBot->next;
+	}
+}
+
+Bot *find_bot(const char *name) {
+	Bot *currentBot = cfg.bot_node;
+
+	while (currentBot != NULL) {
+		if (strcasecmp(currentBot->name, name) == 0) {
+			return currentBot;
+		}
+		currentBot = currentBot->next;
+	}
+
+	return NULL;  // Bot not found
+}
+
+
+
+void free_bot_node() {
+	Bot *currentBot = cfg.bot_node;
+	Bot *nextBot;
+
+	while (currentBot != NULL) {
+		nextBot = currentBot->next;
+		free_bot_commands(currentBot->cmdslist);
+		free(currentBot);
+		currentBot = nextBot;
+	}
+
+	cfg.bot_node = NULL;
+}
 
 /** "Test" the "validity" of emails*/
 int IsValidEmail(const char *email)
@@ -220,7 +505,6 @@ TKL *my_find_tkl_nameban(const char *name)
 	}
 	return NULL;
 }
-
 
 int check_password_strength_dalek(const char *password, int password_strength_requirement) {
 	int length = strlen(password);
@@ -247,6 +531,35 @@ int check_password_strength_dalek(const char *password, int password_strength_re
 	}
 }
 
+// checks the validity of nicks
+bool is_valid_nick(const char *nick) {
+	// Check if the nickname is not NULL
+	if (nick == NULL) {
+		return false;
+	}
+
+	int length = strlen(nick);
+
+	// Check if the length is within the valid range
+	if (length < 1 || length > NICKLEN) {
+		return false;
+	}
+
+	// Check if the first character is a letter
+	if (!isalpha(nick[0])) {
+		return false;
+	}
+
+	// Check if the remaining characters are letters, numbers, underscores, or hyphens
+	for (int i = 1; i < length; ++i) {
+		if (!isalnum(nick[i]) && nick[i] != '_' && nick[i] != '-') {
+			return false;
+		}
+	}
+
+	// If all checks pass, the nickname is valid
+	return true;
+}
 
 /** Query the No-Services API
  @param endpoint The endpoint of the API
@@ -272,13 +585,12 @@ void query_api(const char *endpoint, char *body, const char *callback)
 	free(our_url);
 }
 
-
 char *construct_url(const char *base_url, const char *extra_params) {
-	size_t base_len = strlen(base_url);
-	size_t params_len = strlen(extra_params);
+	size_t base_len = strlen(base_url) +1;
+	size_t params_len = strlen(extra_params)+1;
 	
 	// Calculate the length of the resulting URL (+1 for the null terminator)
-	size_t url_len = base_len + 1 + params_len;
+	size_t url_len = base_len+params_len+1;
 
 	// Allocate memory for the URL
 	char *url = (char *)safe_alloc(url_len);
@@ -312,18 +624,18 @@ static char *ajoin_help[] = {
 	"the examples below use upper-case for the purposes of this example",
 	"-",
 	"Syntax:",
-	"    /AJOIN <add|del|list> [<channel>]",
+	"	/AJOIN <add|del|list> [<channel>]",
 	"-",
 	"Examples:",
 	"-",
 	"Add the channel #PossumsOnly to your auto-join list:",
-	"    /AJOIN add #PossumsOnly",
+	"	/AJOIN add #PossumsOnly",
 	"-",
 	"Delete #BadChannel from your auto-join list",
-	"    /AJOIN del #BadChannel",
+	"	/AJOIN del #BadChannel",
 	"-",
 	"View your auto-join list:",
-	"    /AJOIN list",
+	"	/AJOIN list",
 	"-",
 	END_OF_HELP
 };
@@ -448,6 +760,7 @@ MOD_INIT()
 	CommandAdd(modinfo->handle, "DROP", cmd_drop, 1, CMD_USER);
 	CommandAdd(modinfo->handle, "SADROP", cmd_sadrop, 2, CMD_OPER);
 	CommandAdd(modinfo->handle, "SETPASSWORD", cmd_setpassword, 2, CMD_USER);
+	CommandAdd(modinfo->handle, "BOT", cmd_bot, 2, CMD_OPER);
 	
 	EventAdd(modinfo->handle, "nick_enforce", nick_enforce, NULL, 1000, 0);
 
@@ -477,6 +790,8 @@ MOD_TEST()
 MOD_LOAD()
 {
 	CommandOverrideAdd(modinfo->handle, "AUTHENTICATE", 0, cmd_authenticate_ovr);
+	CommandOverrideAdd(modinfo->handle, "PRIVMSG", 0, cmd_privmsg_ovr);
+	CommandOverrideAdd(modinfo->handle, "NICK", 0, cmd_nick_ovr);
 	return MOD_SUCCESS;
 }
 
@@ -484,6 +799,7 @@ MOD_LOAD()
 MOD_UNLOAD()
 {
 	freecfg();
+	free_bot_node();
 	return MOD_SUCCESS;
 }
 
@@ -501,6 +817,7 @@ void setcfg(void)
 	safe_strdup(cfg.key, "");
 	safe_strdup(cfg.guest_nick, "Guest"); // default
 	cfg.nick_enforce_timeout = 60; // 2 minutes to auth before nick gets changed
+	cfg.bot_node = NULL;
 }
 
 // callback for registering accounts
@@ -623,24 +940,24 @@ CMD_FUNC(cmd_register)
 	}
 	int len = strlen(parv[1]);
 	if (len < 4) {
-        sendto_one(client, NULL, ":%s FAIL REGISTER INVALID_NAME %s :Your account name must be at least 4 characters long..", me.name, parv[1]);
+		sendto_one(client, NULL, ":%s FAIL REGISTER INVALID_NAME %s :Your account name must be at least 4 characters long..", me.name, parv[1]);
 		return;
-    }
+	}
 
 	/* protect against registering serv names lol */
-    const char *target = "serv";
-    int match = 1;
-    // Compare the last 4 characters
-    int i;
-    for (i = 0; i < 4; i++) {
-        char strChar = tolower(parv[1][len - 4 + i]); // Convert string character to lowercase
-        char targetChar = tolower(target[i]);    // Convert target character to lowercase
-        
-        if (strChar != targetChar) {
-            match = 0; // Characters don't match
+	const char *target = "serv";
+	int match = 1;
+	// Compare the last 4 characters
+	int i;
+	for (i = 0; i < 4; i++) {
+		char strChar = tolower(parv[1][len - 4 + i]); // Convert string character to lowercase
+		char targetChar = tolower(target[i]);	// Convert target character to lowercase
+		
+		if (strChar != targetChar) {
+			match = 0; // Characters don't match
 			break;
-        }
-    }
+		}
+	}
 	
 	if (match)
 	{
@@ -668,7 +985,7 @@ CMD_FUNC(cmd_register)
 		sendto_one(client, NULL, ":%s FAIL REGISTER ACCOUNT_NAME_MUST_BE_NICK %s :Your account name must be your nickname.", me.name, account);
 		return;
 	}
-	if (!do_nick_name(account))
+	if (!is_valid_nick(account))
 	{
 		sendto_one(client, NULL, ":%s FAIL REGISTER BAD_ACCOUNT_NAME %s :Your account name must be a valid nickname.", me.name, account);
 		return;
@@ -898,7 +1215,6 @@ void regkeylist_unserialize(const char *str, ModData *m)
 	safe_strdup(m->str, str);
 }
 
-
 void wtdrop_free(ModData *m)
 {
 	safe_free(m->str);
@@ -943,11 +1259,11 @@ const char *sat_serialize(ModData *m)
 }
 void sat_free(ModData *m)
 {
-    m->i = 0;
+	m->i = 0;
 }
 void sat_unserialize(const char *str, ModData *m)
 {
-    m->i = atoi(str);
+	m->i = atoi(str);
 }
 const char *need_login_serialize(ModData *m)
 {
@@ -959,23 +1275,22 @@ const char *need_login_serialize(ModData *m)
 }
 void need_login_free(ModData *m)
 {
-    m->i = 0;
+	m->i = 0;
 }
 void need_login_unserialize(const char *str, ModData *m)
 {
-    m->i = atoi(str);
+	m->i = atoi(str);
 }
 const char *accreg_capability_parameter(Client *client)
 {
 	return moddata_client_get(&me, "regkeylist");
 }
 
-
 int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 {
 	int errors = 0; // Error count
 	int i; // Iterat0r
-	ConfigEntry *cep, *cep2, *cep3; // To store the current variable/value pair etc, nested
+	ConfigEntry *cep; // To store the current variable/value pair etc, nested
 
 	// Since we'll add a top-level block to unrealircd.conf, need to filter on CONFIG_MAIN lmao
 	if (type != CONFIG_MAIN)
@@ -996,7 +1311,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 		// This should already be checked by Unreal's core functions but there's no harm in having it here too =]
 		if (!cep->name)
 		{
-			config_error("%s:%i: blank %s item", cep->file->filename, cep->line_number, NO_SERVICES_CONF); // Rep0t error
+			config_error("[no-services] %s:%i: blank %s item", cep->file->filename, cep->line_number, NO_SERVICES_CONF); // Rep0t error
 			errors++; // Increment err0r count
 			continue; // Next iteration imo tbh
 		}
@@ -1005,7 +1320,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 		{
 			if (cfg.got_url)
 			{
-				config_error("%s:%i: duplicate %s::%s directive. Only one URL is supported at this time.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+				config_error("[no-services] %s:%i: duplicate %s::%s directive. Only one URL is supported at this time.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 				errors++;
 				continue;
 			}
@@ -1013,7 +1328,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 			cfg.got_url = 1;
 			if (!strlen(cep->value))
 			{
-				config_error("%s:%i: %s::%s must be non-empty", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+				config_error("[no-services] %s:%i: %s::%s must be non-empty", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 				errors++;
 				continue;
 			}
@@ -1025,7 +1340,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 		{
 			if (cfg.got_key)
 			{
-				config_error("%s:%i: duplicate %s::%s directive", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+				config_error("[no-services] %s:%i: duplicate %s::%s directive", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 				errors++;
 				continue;
 			}
@@ -1033,7 +1348,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 			cfg.got_key = 1;
 			if (!strlen(cep->value))
 			{
-				config_error("%s:%i: %s::%s must be non-empty", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+				config_error("[no-services] %s:%i: %s::%s must be non-empty", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 				errors++;
 				continue;
 			}
@@ -1043,13 +1358,13 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 		{
 			if (cfg.got_nick_enforcement_timeout)
 			{
-				config_error("%s:%i: duplicate %s::%s directive.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+				config_error("[no-services] %s:%i: duplicate %s::%s directive.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 				errors++;
 				continue;
 			}
 			if (config_checkval(cep->value, CFG_TIME) <= 0)
 			{
-				config_error("%s:%i: %s::%s must be a time string like '7d10m' or simply '20'", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+				config_error("[no-services] %s:%i: %s::%s must be a time string like '7d10m' or simply '20'", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 				errors++;
 				continue;
 			}
@@ -1061,13 +1376,13 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 		{
 			if (cfg.got_guest_nick)
 			{
-				config_error("%s:%i: duplicate %s::%s directive.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+				config_error("[no-services] %s:%i: duplicate %s::%s directive.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 				errors++;
 				continue;
 			}
 			if (!strlen(cep->value))
 			{
-				config_error("%s:%i: %s::%s must be non-empty", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+				config_error("[no-services] %s:%i: %s::%s must be non-empty", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 				errors++;
 				continue;
 			}
@@ -1078,11 +1393,12 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 		
 		if (!strcmp(cep->name, "account-registration"))
 		{
+			ConfigEntry *cep2, *cep3;
 			for (cep2 = cep->items; cep2; cep2 = cep2->next)
 			{
 				if (!cep2->name)
 				{
-					config_error("%s:%i: blank %s::%s entry", cep2->file->filename, cep2->line_number, NO_SERVICES_CONF, cep->name); // Rep0t error
+					config_error("[no-services] %s:%i: blank %s::%s entry", cep2->file->filename, cep2->line_number, NO_SERVICES_CONF, cep->name); // Rep0t error
 					errors++;
 					continue;
 				}
@@ -1094,7 +1410,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 						if (!strcmp(cep3->name, "before-connect"))
 						{
 							if (cfg.register_before_connect) {
-								config_warn("%s:%i: duplicate %s::%s directive, ignoring.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
+								config_warn("[no-services] %s:%i: duplicate %s::%s directive, ignoring.", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name);
 								errors++;
 								continue;
 							}
@@ -1105,7 +1421,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 						if (!strcmp(cep3->name, "custom-account-name"))
 						{
 							if (cfg.register_custom_account) {
-								config_warn("%s:%i: duplicate %s::%s directive, ignoring.", cep3->file->filename, cep3->line_number, NO_SERVICES_CONF, cep3->name);
+								config_warn("[no-services] %s:%i: duplicate %s::%s directive, ignoring.", cep3->file->filename, cep3->line_number, NO_SERVICES_CONF, cep3->name);
 								errors++;
 								continue;
 							}
@@ -1116,33 +1432,51 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 						if (!strcmp(cep3->name, "email-required"))
 						{
 							if (cfg.register_email_required) {
-								config_warn("%s:%i: duplicate %s::%s directive, ignoring.", cep3->file->filename, cep3->line_number, NO_SERVICES_CONF, cep3->name);
+								config_warn("[no-services] %s:%i: duplicate %s::%s directive, ignoring.", cep3->file->filename, cep3->line_number, NO_SERVICES_CONF, cep3->name);
 								errors++;
 								continue;
 							}
 							cfg.register_email_required = 1;
 							continue;
 						}
-						config_warn("%s:%i: unknown item %s::%s::%s::%s", cep3->file->filename, cep3->line_number, NO_SERVICES_CONF, cep->name, cep2->name, cep3->name); 
+						config_warn("[no-services] %s:%i: unknown item %s::%s::%s::%s", cep3->file->filename, cep3->line_number, NO_SERVICES_CONF, cep->name, cep2->name, cep3->name); 
 					}
 					continue;
 				}
 				else if (!strcmp(cep2->name, "password-strength"))
 				{
 					if (cfg.got_password_strength_requirement) {
-						config_warn("%s:%i: duplicate %s::%s directive, ignoring.", cep2->file->filename, cep2->line_number, NO_SERVICES_CONF, cep2->name);
+						config_warn("[no-services] %s:%i: duplicate %s::%s directive, ignoring.", cep2->file->filename, cep2->line_number, NO_SERVICES_CONF, cep2->name);
 						errors++;
 						continue;
 					}
 					cfg.got_password_strength_requirement = 1;
 					continue;
 				}
-				config_warn("%s:%i: unknown item %s::%s::%s", cep2->file->filename, cep2->line_number, NO_SERVICES_CONF, cep->name, cep2->name); // Rep0t warn if unknown directive =]
+				config_warn("[no-services] %s:%i: unknown item %s::%s::%s", cep2->file->filename, cep2->line_number, NO_SERVICES_CONF, cep->name, cep2->name); // Rep0t warn if unknown directive =]
 			}
 			continue;
 		}
+		if (!strcmp(cep->name, "bot"))
+		{
+			ConfigEntry *cep2;
+			if (!cep->items)
+				continue;
+			for (cep2 = cep->items; cep2; cep2 = cep2->next)
+			{
+				if (!is_valid_nick(cep2->name))
+				{
+					config_warn("[no-services] %s:%i: Invalid bot nick %s at %s::%s directive.", cep2->file->filename, cep2->line_number, cep2->name, NO_SERVICES_CONF, "bot");
+					errors++;
+					continue;
+				}
+				
+			}
+			continue;
+		}
+
 		// Anything else is unknown to us =]
-		config_warn("%s:%i: unknown item %s::%s", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name); // So display just a warning
+		config_warn("[no-services] %s:%i: unknown item %s::%s", cep->file->filename, cep->line_number, NO_SERVICES_CONF, cep->name); // So display just a warning
 	}
 	if (!cfg.got_key || !cfg.got_url)
 	{
@@ -1159,10 +1493,9 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 	return errors ? -1 : 1; // Returning 1 means "all good", -1 means we shat our panties
 }
 
-
 // "Run" the config (everything should be valid at this point)
 int noservices_configrun(ConfigFile *cf, ConfigEntry *ce, int type) {
-	ConfigEntry *cep, *cep2, *cep3; // To store the current variable/value pair etc, nested
+	ConfigEntry *cep; // To store the current variable/value pair etc, nested
 
 	// Since we'll add a top-level block to unrealircd.conf, need to filter on CONFIG_MAIN lmao
 	if (type != CONFIG_MAIN)
@@ -1201,6 +1534,7 @@ int noservices_configrun(ConfigFile *cf, ConfigEntry *ce, int type) {
 		}
 		if (!strcmp(cep->name, "account-registration"))
 		{
+			ConfigEntry *cep2, *cep3;
 			for (cep2 = cep->items; cep2; cep2 = cep2->next)
 			{
 				if (!cep2->name)
@@ -1236,6 +1570,32 @@ int noservices_configrun(ConfigFile *cf, ConfigEntry *ce, int type) {
 					continue;
 				}
 			}
+		}
+
+		/** Bots */
+		if (!strcmp(cep->name, "bot"))
+		{
+			ConfigEntry *cep2;
+			for (cep2 = cep->items; cep2; cep2 = cep2->next)
+			{
+				Bot *bot = AddBot(cep2->name);
+				ConfigEntry *cep3;
+				for (cep3 = cep2->items; cep3; cep3 = cep3->next)
+				{
+					if (!CommandExists(cep3->name))
+					{
+						config_warn("[no-services] %s:%i: Cannot add command '%s' to %s bot at %s::%s directive: Command exists.", cep3->file->filename, cep3->line_number, cep3->name, cep2->name, NO_SERVICES_CONF, "bot");
+						continue;
+					}
+					if (BadPtr(cep3->value) || !strlen(cep3->value))
+					{
+						config_warn("[no-services] %s:%i: Cannot add command '%s' to %s bot at %s::%s directive: No helptext defined.", cep3->file->filename, cep3->line_number, cep3->name, cep2->name, NO_SERVICES_CONF, "bot");
+						continue;
+					}
+					add_command_to_bot(bot, cep3->name, cep3->value);
+				}
+			}
+			continue;
 		}
 	}
 	if (!cfg.got_password_strength_requirement) // you have to explicitly enable 0 to work
@@ -1357,6 +1717,8 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 			else
 				sendto_one(client, NULL, ":%s FAIL LOGIN %s %s :%s", me.name, code, account, reason);
 			add_fake_lag(client, 10000); // ten second penalty for bad logins
+		} else {
+			sendnotice(client, "Something weird.. happened...... %s %s", code, account);
 		}
 	}
 
@@ -1539,7 +1901,6 @@ int sasl_capability_visible(Client *client)
 	return 1;
 }
 
-
 const char *sasl_capability_parameter(Client *client)
 {
 	return "PLAIN,EXTERNAL"; /* NOTE: could still return NULL */
@@ -1689,7 +2050,6 @@ CMD_FUNC(cmd_ajoin)
 	add_fake_lag(client, 1000); // lag 'em for 5 seconds
 }
 
-
 CMD_FUNC(cmd_logout)
 {
 	if (!IsLoggedIn(client))
@@ -1772,7 +2132,6 @@ void connect_query_user(Client *client)
 	query_api("account", json_serialized, "connect_query_user_response");
 	return;
 }
-
 
 void connect_query_user_response(OutgoingWebRequest *request, OutgoingWebResponse *response)
 {
@@ -1938,7 +2297,6 @@ CMD_FUNC(cmd_certfp)
 	add_fake_lag(client, 500);
 }
 
-
 void certfp_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
 {
 	json_t *result;
@@ -2014,7 +2372,6 @@ void certfp_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
 
 	json_decref(result);
 }
-
 
 int noservices_hook_post_local_nickchange(Client *client, MessageTag *mtags, const char *oldnick)
 {
@@ -2124,7 +2481,7 @@ EVENT(nick_enforce)
 	Client *client;
 	TKL *tkl;
 	long long change_by = (long long)TStime() +  random_number(300,1800);
-    list_for_each_entry(client, &lclient_list, lclient_node)
+	list_for_each_entry(client, &lclient_list, lclient_node)
 	{
 		if (UserRequiresLogin(client) && (client->lastnick + cfg.nick_enforce_timeout) < TStime())
 		{
@@ -2144,20 +2501,19 @@ EVENT(nick_enforce)
 				ircsnprintf(exp, sizeof(exp), "%lld",  change_by);
 				
 				const char* tkllayer[10] = {
-					me.name,        /*0  server.name */
-					"+",            /*1  + = X-line add */
-					"Q",            /*2  X-line type  */
-					"H" ,           /*3  user */
-					client->name,        /*4  host */
+					me.name,		/*0  server.name */
+					"+",			/*1  + = X-line add */
+					"Q",			/*2  X-line type  */
+					"H" ,		   /*3  user */
+					client->name,		/*4  host */
 					"no-services",   /*5  Who set the ban */
-					exp,            /*6  expire_at; never expire */
-					mo,           /*7  set_at */
-					"You must login to use that nick.",    /*8  default reason */
+					exp,			/*6  expire_at; never expire */
+					mo,		   /*7  set_at */
+					"You must login to use that nick.",	/*8  default reason */
 					NULL		/*9 Extra NULL element to prevent OOB */
 				};
 				
 				cmd_tkl(&me, NULL, sizeof(tkllayer), tkllayer);
-
 
 				// change their nick to
 				const char *parv[3];
@@ -2199,7 +2555,6 @@ CMD_FUNC(cmd_release)
 		return;
 	}
 
-
 	TKL *nameban;
 	nameban = find_tkl_nameban(TKL_NAME | TKL_GLOBAL, client->user->account, 1);
 	if (!nameban)
@@ -2221,7 +2576,6 @@ CMD_FUNC(cmd_release)
 	sendto_one(client, NULL, ":%s RELEASE SUCCESS ACCOUNT_RELEASED :Nick \"%s\" has been released. You may now use the nick.", me.name, client->user->account);
 	
 }
-
 
 CMD_FUNC(cmd_drop)
 {
@@ -2248,7 +2602,6 @@ CMD_FUNC(cmd_drop)
 	}
 	sendto_one(client, NULL, ":%s DROP * INCORRECT_CODE %s :The code you entered was incorrect.", me.name, client->user->account);	
 }
-
 
 CMD_FUNC(cmd_sadrop)
 {
@@ -2281,7 +2634,6 @@ void do_account_drop(const char *account, const char *callback_uid)
 	json_decref(j);
 	query_api("account", json_serialized, "drop_callback");
 }
-
 
 CMD_FUNC(cmd_setpassword)
 {
@@ -2338,7 +2690,6 @@ int set_user_password(Client *client, const char *account, const char *password)
 	query_api("account", json_serialized, "setpassword_callback");
 	return 1;
 }
-
 
 void setpassword_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
 {
@@ -2504,4 +2855,146 @@ void drop_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
 	}
 
 	json_decref(result);
+}
+
+CMD_FUNC(cmd_bot)
+{
+	if (BadPtr(parv[1]))
+		return;
+
+	if (!strcasecmp(parv[1],"add") && !BadPtr(parv[2]))
+	{
+		Bot *bot = find_bot(parv[2]);
+		if (bot)
+		{
+			sendnotice(client, "A bot with that name already exists");
+			return;
+		}
+		if (!is_valid_nick(parv[2]))
+		{
+			sendnotice(client, "Invalid bot nick");
+			return;
+		}
+		AddBot(parv[2]);
+	}
+	if (!strcasecmp(parv[1],"del") && !BadPtr(parv[2]))
+	{
+		DelBot(parv[2]);
+	}
+	else if (!strcasecmp(parv[1], "list"))
+	{
+		Bot *currentBot;
+		if (cfg.bot_node)
+			sendnotice(client, "\002\035Listing available server bots:\002\035");
+		else
+		{
+			sendnotice(client, "\002No available server bots\002");
+			return;
+		}
+		int i = 1; 
+		for (currentBot = cfg.bot_node; currentBot != NULL; currentBot = currentBot->next)
+		{
+			bot_sendnotice(currentBot, client, "\035%d)\035 %s", i, currentBot->name);
+			i++;
+		}
+	}
+}
+
+CMD_OVERRIDE_FUNC(cmd_privmsg_ovr)
+{
+	Bot *bot;
+	if (BadPtr(parv[1]))
+	{
+		CALL_NEXT_COMMAND_OVERRIDE();
+		return;
+	}
+	bot = find_bot(parv[1]);
+	if (!bot)
+	{
+		CALL_NEXT_COMMAND_OVERRIDE();
+		return;
+	}
+
+	// it's definitely for us
+	if (!strcasecmp(parv[2], "help"))
+	{
+		BotCommand *cmd = bot->cmdslist;
+		bot_sendnotice(bot, client, "Showing all available commands for %s:", bot->name);
+		bot_sendnotice(bot, client, " ");
+		while (cmd)
+		{
+			char spaces[20] = "";
+			int i = 0;
+			int difference = sizeof(spaces) - strlen(cmd->command);
+			for (; i < difference; i++)
+				strlcat(spaces," ", sizeof(spaces));
+
+			
+			bot_sendnotice(bot, client, "%s%s%s", cmd->command, spaces, cmd->helptext);
+			cmd = cmd->next;
+		}
+		bot_sendnotice(bot, client, " ");
+		bot_sendnotice(bot, client, "End of commands list for %s", bot->name);
+		return;
+	}
+	
+	char *parvdup = strdup(parv[2]);
+	
+	const char *parx[MAXPARA];
+	parx[0] = NULL;
+	int i = 1;
+
+	char* token = strtok(parvdup, " ");
+	
+	RealCommand *realcmd = find_command_simple(token);
+	if (!realcmd)
+	{
+		free(parvdup);
+		return;
+	}
+	
+	char remnants[MAXLINELENGTH] = "";
+    for (token = strtok(NULL, " "); token != NULL;token = strtok(NULL, " "))
+	{
+		if (i < realcmd->parameters)
+		{
+	        parx[i] = token;
+			i++;
+		}
+		else
+		{
+			strcat(remnants, token);
+			strcat(remnants, " ");
+		}
+    }
+
+	if (strlen(remnants) > 1)
+	{
+		remnants[strlen(remnants) - 1] = '\0'; // drop that last space
+		parx[i] = remnants;
+	}
+	else
+		parx[i] = "";
+	parx[i + 1] = NULL;
+
+	// ALL SET VALWARE M'GIRL
+	do_cmd(client, recv_mtags, realcmd->cmd, realcmd->parameters, parx);
+	free(parvdup);
+}
+
+CMD_OVERRIDE_FUNC(cmd_nick_ovr)
+{
+	if ((parc < 2) || BadPtr(parv[1]))
+	{
+		CALL_NEXT_COMMAND_OVERRIDE();
+		return;
+	}
+
+	Bot *bot = find_bot(parv[1]);
+	if (bot)
+	{
+		sendnumeric(client, ERR_ERRONEUSNICKNAME, bot->name, "Reserved for internal IRCd purposes");
+		return;
+	}
+	CALL_NEXT_COMMAND_OVERRIDE();
 }
