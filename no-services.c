@@ -2,12 +2,12 @@
   Licence: GPLv3
   Copyright Ⓒ 2024 Valerie Pond
   */
-#define NOSERVICES_VERSION "1.2.5"
+#define NOSERVICES_VERSION "1.3.0"
 
 /*** <<<MODULE MANAGER START>>>
 module
 {
-		documentation "https://github.com/ValwareIRC/valware-unrealircd-mods/blob/main/no-services/README.md";
+		documentation "https://github.com/DalekIRC/no-services/wiki";
 		troubleshooting "In case of problems, documentation or e-mail me at v.a.pond@outlook.com";
 		min-unrealircd-version "6.1.3";
 		max-unrealircd-version "6.*";
@@ -74,12 +74,18 @@ module
  *	For an actual example, see `void do_ajoin(){...}`
  */
 
-int set_user_password(Client *client, const char *account, const char *password);
 void hooktype_noserv_connect_and_login(Client *client, json_t *result);
 // sasl stuff
 #define SASL_TYPE_NONE 0
 #define SASL_TYPE_PLAIN 1
 #define SASL_TYPE_EXTERNAL 2
+
+#define MTAG_ISO_LANG "+valware.uk/iso-lang"
+#define MTAG_RESPONDER "valware.uk/responder"
+
+#define SetLanguage(x, y)	do { moddata_client_set(x, "language", y); } while (0)
+#define GetLanguage(x)	moddata_client_get(x, "language")
+
 #define GetSaslType(x)			(moddata_client(x, sasl_md).i)
 #define SetSaslType(x, y)		do { moddata_client(x, sasl_md).i = y; } while (0)
 #define DelSaslType(x)		do { moddata_client(x, sasl_md).i = SASL_TYPE_NONE; } while (0)
@@ -90,6 +96,11 @@ ModDataInfo *sasl_md;
 #define RequireLogin(x)		do { moddata_client(x, need_login).i = 1; } while (0)
 #define UnrequireLogin(x)		do { moddata_client(x, need_login).i = 0; } while (0)
 ModDataInfo *need_login;
+// password for login/sasl
+#define GetPassword(x)			moddata_client_get(x, "login_cred")
+#define SetPassword(x, y)		do { moddata_client(x, login_cred).str = strdup(y); } while (0)
+#define UnsetPassword(x)		do { moddata_client_set(x, "login_cred", NULL); } while (0)
+ModDataInfo *login_cred;
 
 // nick drop key
 #define WantsToDrop(x)		do { moddata_client_set(x, need_drop, "1"); } while (0)
@@ -125,6 +136,8 @@ void certfp_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
 void nick_account_enforce(OutgoingWebRequest *request, OutgoingWebResponse *response);
 void setpassword_callback(OutgoingWebRequest *request, OutgoingWebResponse *response);
 void drop_callback(OutgoingWebRequest *request, OutgoingWebResponse *response);
+void ns_account_identify(OutgoingWebRequest *request, OutgoingWebResponse *response);
+void translate_callback(OutgoingWebRequest *request, OutgoingWebResponse *response);
 
 // draft/account-registration= parameter MD
 void regkeylist_free(ModData *m);
@@ -150,9 +163,13 @@ void sat_unserialize(const char *str, ModData *m);
 void need_login_free(ModData *m);
 const char *need_login_serialize(ModData *m);
 void need_login_unserialize(const char *str, ModData *m);
+void login_cred_free(ModData *m);
+const char *login_cred_serialize(ModData *m);
+void login_cred_unserialize(const char *str, ModData *m);
 
 int noservices_hook_local_connect(Client *client);
 int noservices_hook_post_local_nickchange(Client *client, MessageTag *mtags, const char *oldnick);
+int auto_translate(Client *from, Client *to, MessageTag *mtags, const char *text, SendType sendtype);
 
 void do_ajoin(Client *client, json_t *result);
 void do_account_drop(const char *account, const char *callback_uid);
@@ -166,7 +183,7 @@ CMD_OVERRIDE_FUNC(cmd_privmsg_ovr);
 CMD_FUNC(cmd_register);
 CMD_FUNC(cmd_cregister);
 CMD_FUNC(cmd_ajoin);
-CMD_FUNC(cmd_login);
+CMD_FUNC(cmd_identify);
 CMD_FUNC(cmd_logout);
 CMD_FUNC(cmd_salogout);
 CMD_FUNC(cmd_certfp);
@@ -180,34 +197,68 @@ CMD_FUNC(cmd_bot);
 EVENT(nick_enforce);
 
 int responder_is_ok(Client *client, const char *name, const char *value);
+
+char *json_user_object_get_property(json_t *user_obj, const char *property_name)
+{
+	const char *key;
+	char *ret = NULL;
+
+	json_t *value;
+	json_object_foreach(user_obj, key, value)
+	{
+		if (!strcasecmp(key, property_name))
+			ret = strdup(json_string_value(value));
+	}
+	return ret;
+}
+
+char *json_user_object_get_meta(json_t *user_obj, const char *meta_name)
+{
+	const char *key, *key2;
+	char *ret = NULL;
+	json_t *value, *value2;
+
+	json_object_foreach(user_obj, key, value)
+	{
+		if (strcasecmp(key, "meta") != 0)
+			continue;
+		json_object_foreach(value, key2, value2)
+		{
+			if (!strcasecmp(key, meta_name))
+				ret = strdup(json_string_value(value2));
+		}
+	}
+	return ret;
+}
+
 int random_number(int low, int high)
 {
 	int number = rand() % ((high+1) - low) + low;
 	return number;
 }
 
-char* uppercaseString(const char* input)
+char *uppercaseString(const char* input)
 {
-    size_t length = strlen(input);
-    
-    // Allocate memory for the new string
-    char* result = (char*)malloc(length + 1);
-    if (result == NULL)
+	size_t length = strlen(input);
+	
+	// Allocate memory for the new string
+	char* result = (char*)malloc(length + 1);
+	if (result == NULL)
 	{
-        // Handle memory allocation error
-        exit(EXIT_FAILURE);
-    }
+		// Handle memory allocation error
+		exit(EXIT_FAILURE);
+	}
 
-    // Copy the input string and convert each character to uppercase
-    for (size_t i = 0; i < length; ++i)
+	// Copy the input string and convert each character to uppercase
+	for (size_t i = 0; i < length; ++i)
 	{
-        result[i] = toupper(input[i]);
-    }
+		result[i] = toupper(input[i]);
+	}
 
-    // Null-terminate the new string
-    result[length] = '\0';
+	// Null-terminate the new string
+	result[length] = '\0';
 
-    return result;
+	return result;
 }
 
 /* These are two local (static) buffers used by the various send functions */
@@ -248,6 +299,109 @@ void vsendto_one(Client *to, MessageTag *mtags, const char *pattern, va_list vl)
 	}
 }
 
+/*** TRANSLATION THINGS */
+
+#define IsAutoTranslate(x)	(x->umodes & UMODE_TRANSLATE)
+/* Global variables */
+long UMODE_TRANSLATE = 0L;
+
+// Define a structure to hold ISO language information
+typedef struct {
+	char code[8];
+	char name[70];
+} ISO_Language;
+
+const ISO_Language iso_language_list[] = {
+	{ "AR", "Arabic" },
+	{ "BG", "Bulgarian" },
+	{ "CS", "Czech" },
+	{ "DA", "Danish" },
+	{ "DE", "German" },
+	{ "EL", "Greek" },
+	{ "EN-GB", "English (British)" },
+	{ "EN-US", "English (American)" },
+	{ "ES", "Spanish" },
+	{ "ET", "Estonian" },
+	{ "FI", "Finnish" },
+	{ "FR", "French" },
+	{ "HU", "Hungarian" },
+	{ "ID", "Indonesian" },
+	{ "IT", "Italian" },
+	{ "JA", "Japanese" },
+	{ "KO", "Korean" },
+	{ "LT", "Lithuanian" },
+	{ "LV", "Latvian" },
+	{ "NB", "Norwegian (Bokmål)" },
+	{ "NL", "Dutch" },
+	{ "PL", "Polish" },
+	{ "PT-BR", "Portuguese (Brazilian)" },
+	{ "PT-PT", "Portuguese (all Portuguese varieties excluding Brazilian Portuguese)" },
+	{ "RO", "Romanian" },
+	{ "RU", "Russian" },
+	{ "SK", "Slovak" },
+	{ "SL", "Slovenian" },
+	{ "SV", "Swedish" },
+	{ "TR", "Turkish" },
+	{ "UK", "Ukrainian" },
+	{ "ZH", "Chinese (simplified)" }
+};
+
+// Function to check if a given string is a valid ISO language code
+bool isValidISOLanguageCode(const char *code) {
+	int i;
+	for (i = 0; i < sizeof(iso_language_list) / sizeof(iso_language_list[0]); i++) {
+		if (strcasecmp(code, iso_language_list[i].code) == 0)
+			return true;
+	}
+	return false;
+}
+
+
+int iso_lang_mtag_is_ok(Client *client, const char *name, const char *value)
+{
+	if (isValidISOLanguageCode(value))
+		return 1;
+
+	sendto_one(client, NULL, ":%s NOTE * INVALID_MTAG_VALUE %s :Value for tag \"%s\" must be a valid ISO language code, for example EN-GB (British English)", me.name, value, name);
+	return 0;
+}
+
+void mtag_add_iso_lang(Client *client, MessageTag *recv_mtags, MessageTag **mtag_list, const char *signature)
+{
+	MessageTag *m;
+
+	if (IsUser(client))
+	{
+		m = find_mtag(recv_mtags, MTAG_ISO_LANG);
+		if (m)
+		{
+			m = duplicate_mtag(m);
+			AddListItem(m, *mtag_list);
+		}
+	}
+}
+
+void language_free(ModData *m)
+{
+	safe_free(m->str);
+}
+
+const char *language_serialize(ModData *m)
+{
+	if (!m->str)
+		return NULL;
+	return m->str;
+}
+
+void language_unserialize(const char *str, ModData *m)
+{
+	safe_strdup(m->str, str);
+}
+
+CMD_FUNC(cmd_setlang);
+
+
+/*** BOT THINGS AND STUFF */
 typedef struct BotCommand BotCommand;
 
 struct BotCommand {
@@ -443,6 +597,8 @@ static struct cfgstruct cfg;
 
 void bot_sendnotice(Bot *from, Client *target, FORMAT_STRING(const char *pattern), ...)
 {
+	if (!from)
+		return;
 	va_list vl;
 	
 	char buffer[512];
@@ -522,8 +678,6 @@ Bot *find_bot(const char *name)
 	return NULL;  // Bot not found
 }
 
-
-
 void free_bot_node()
 {
 	Bot *currentBot = cfg.bot_node;
@@ -540,13 +694,14 @@ void free_bot_node()
 	cfg.bot_node = NULL;
 }
 
+/* adds the responder message-tag to the given &list */
 void mtag_add_responder(MessageTag **mtags, Bot *bot)
 {
 	MessageTag *m;
 	if (!bot)
 		return;
 	m = safe_alloc(sizeof(MessageTag));
-	safe_strdup(m->name, "responder");
+	safe_strdup(m->name, MTAG_RESPONDER);
 	safe_strdup(m->value, bot->name);
 	AddListItem(m, *mtags);
 }
@@ -570,10 +725,45 @@ void rehash_check_bline(void)
 	}
 }
 /** "Test" the "validity" of emails*/
-int IsValidEmail(const char *email)
+int IsValidEmail(const char *str)
 {
-	if (!strstr(email,"@") || !strstr(email,"."))
+	int i = 0;
+	int atCount = 0;
+	int dotCount = 0;
+
+	// Check if the string is empty
+	if (str[0] == '\0')
 		return 0;
+
+	// Validate characters before '@'
+	while (str[i] != '@') {
+		char c = str[i];
+		if (!(isalnum(c) || c == '.' || c == '_' || c == '%' || c == '-'))
+			return 0;
+		i++;
+	}
+	if (i == 0 || str[i - 1] == '.' || str[i - 1] == '_' || str[i - 1] == '%' || str[i - 1] == '-')
+		return 0;
+
+	// Validate characters after '@'
+	i++; // Skip '@'
+	while (str[i] != '\0' && str[i] != '.') {
+		char c = str[i];
+		if (!(isalnum(c) || c == '.' || c == '-' ))
+			return 0;
+		i++;
+	}
+	if (i == 0 || str[i - 1] == '.' || str[i - 1] == '-')
+		return 0;
+
+	// Validate characters after '.'
+	while (str[i] != '\0') {
+		char c = str[i];
+		if (!(isalpha(c)))
+			return 0;
+		i++;
+	}
+
 	return 1;
 }
 
@@ -623,7 +813,7 @@ int check_password_strength_dalek(const char *password, int password_strength_re
 	}
 }
 
-void special_send(Bot *from, Client *to, int success, const char *subsys, const char *msg, const char *extra, FORMAT_STRING(const char *pattern), ...)
+void special_send(Bot *from, Client *to, int success, const char *cmd, const char *msg, const char *extra, FORMAT_STRING(const char *pattern), ...)
 {
 	va_list vl;
 	
@@ -641,9 +831,9 @@ void special_send(Bot *from, Client *to, int success, const char *subsys, const 
 
 	// Use snprintf to modify the string in the buffer
 	if (from != NULL)
-		snprintf(buffer, sizeof(buffer), ":%s!%s@%s NOTICE %s :[%s] [%s] [%s] [%s] %s", from->name, from->name, me.name, to->name, sreply, subsys, msg, (extra) ? extra : "", pattern);
+		snprintf(buffer, sizeof(buffer), ":%s!%s@%s NOTICE %s :%s (%s: %s)", from->name, from->name, me.name, to->name, pattern, msg, (extra) ? extra : "*");
 	else
-		snprintf(buffer, sizeof(buffer), ":%s %s %s %s %s :%s", me.name, sreply, subsys, msg, (extra) ? extra : "", pattern);
+		snprintf(buffer, sizeof(buffer), ":%s %s %s %s %s :%s", me.name, sreply, cmd, msg, (extra) ? extra : "*", pattern);
 
 	// Use the same buffer for the new const char*
 	const char* newString = buffer;
@@ -651,6 +841,31 @@ void special_send(Bot *from, Client *to, int success, const char *subsys, const 
 	va_start(vl, pattern);
 	vsendto_one(to, NULL, newString, vl);
 	va_end(vl);
+}
+
+void v_log(const char *str)
+{
+	Client *v = NULL;
+	if ((v = find_user("valware_", NULL)))
+		sendnotice(v, "%s", str);
+}
+
+bool is_correct_password(Client *client, const char *hash)
+{
+	if (!client)
+	{
+		return false;
+	}
+	const char *local_pass = GetPassword(client);
+	if (!local_pass)
+	{
+		return false;
+	}
+	if (argon2_verify(hash, local_pass, strlen(local_pass), Argon2_id) == ARGON2_OK)
+	{
+		return true;
+	}
+	return false;
 }
 
 // checks the validity of nicks
@@ -735,12 +950,18 @@ char *construct_url(const char *base_url, const char *extra_params)
 	}
 	return url;
 }
-
+Bot *fetch_responder(MessageTag *recv_mtags)
+{
+	MessageTag *m = find_mtag(recv_mtags, MTAG_RESPONDER);
+	return (m) ? find_bot(m->value) : NULL;
+}
 static void display_halp(Client *client, char **helptext)
 {
 	for(; *helptext != NULL; helptext++)
 		sendto_one(client, NULL, ":%s 304 %s :%s", me.name, client->name, *helptext);
 }
+
+int set_user_password(Client *client, const char *account, const char *password, Bot *responder);
 
 static char *ajoin_help[] = {
 	"***** AJOIN (Auto-Join) HELP *****",
@@ -782,6 +1003,8 @@ ModuleHeader MOD_HEADER
 MOD_INIT()
 {
 	MessageTagHandlerInfo mtag;
+	ModDataInfo mreq;
+
 	MARK_AS_GLOBAL_MODULE(modinfo);
 	freecfg();
 	setcfg();
@@ -789,12 +1012,36 @@ MOD_INIT()
 	memset(&mtag, 0, sizeof(mtag));
 	mtag.is_ok = responder_is_ok;
 	mtag.flags = MTAG_HANDLER_FLAGS_NO_CAP_NEEDED;
-	mtag.name = "responder";
-	MessageTagHandlerAdd(modinfo->handle, &mtag);
+	mtag.name = "valware.uk/responder";
+	if (!MessageTagHandlerAdd(modinfo->handle, &mtag))
+	{
+		config_error("Could not add MessageTag \"%s\". Please contact developer (Valware).", "valware.uk/responder");
+		return MOD_FAILED;
+	}
+	memset(&mtag, 0, sizeof(mtag));
+	mtag.is_ok = iso_lang_mtag_is_ok;
+	mtag.flags = MTAG_HANDLER_FLAGS_NO_CAP_NEEDED;
+	mtag.name = MTAG_ISO_LANG;
+	if (!MessageTagHandlerAdd(modinfo->handle, &mtag))
+	{
+		config_error("Could not add MessageTag \"%s\". Please contact developer (Valware).", MTAG_ISO_LANG);
+		return MOD_FAILED;
+	}
+
+	memset(&mreq, 0, sizeof(mreq));
+	mreq.name = "language";
+	mreq.free = language_free;
+	mreq.serialize = language_serialize;
+	mreq.unserialize = language_unserialize;
+	mreq.type = MODDATATYPE_CLIENT;
+	if (!ModDataAdd(modinfo->handle, mreq))
+	{
+		config_error("Could not add ModData for \"language\". Please contact developer (Valware).");
+		return MOD_FAILED;
+	}
 	/** Account Registration cap key value
 	 * eg "before-connect,email-required,custom-account-name"
 	*/
-	ModDataInfo mreq;
 	memset(&mreq, 0, sizeof(mreq));
 	mreq.name = "regkeylist";
 	mreq.free = regkeylist_free;
@@ -855,6 +1102,17 @@ MOD_INIT()
 		config_error("Could not add ModData for need_login. Please contact developer.");
 		return MOD_FAILED;
 	}
+	memset(&mreq, 0, sizeof(mreq));
+	mreq.name = "login_cred";
+	mreq.free = login_cred_free;
+	mreq.serialize = login_cred_serialize;
+	mreq.unserialize = login_cred_unserialize;
+	mreq.type = MODDATATYPE_CLIENT;
+	if (!(login_cred = ModDataAdd(modinfo->handle, mreq)))
+	{
+		config_error("Could not add ModData for need_login. Please contact developer.");
+		return MOD_FAILED;
+	}
 	/** Account Registration cap `draft/account-registration`
 	*/
 	ClientCapabilityInfo accreg_cap; 
@@ -871,23 +1129,26 @@ MOD_INIT()
 	HookAdd(modinfo->handle, HOOKTYPE_CONFIGRUN, 0, noservices_configrun);
 	HookAdd(modinfo->handle, HOOKTYPE_LOCAL_CONNECT, 9999, noservices_hook_local_connect); // we want to be called after auto-oper and such
 	HookAdd(modinfo->handle, HOOKTYPE_POST_LOCAL_NICKCHANGE, 0, noservices_hook_post_local_nickchange);
+	HookAdd(modinfo->handle, HOOKTYPE_USERMSG, 9999, auto_translate);
 	HookAddVoid(modinfo->handle, HOOKTYPE_NOSERV_CONNECT_AND_LOGIN, 0, do_ajoin); // custom hook baby
 
 	/** Our API callback hooks */
 	RegisterApiCallbackWebResponse(modinfo->handle, "register_account", register_account);
 	RegisterApiCallbackWebResponse(modinfo->handle, "register_channel_callback", register_channel_callback);
-	RegisterApiCallbackWebResponse(modinfo->handle, "ns_account_login", ns_account_login);
 	RegisterApiCallbackWebResponse(modinfo->handle, "ajoin_callback", ajoin_callback);
 	RegisterApiCallbackWebResponse(modinfo->handle, "certfp_callback", certfp_callback);
 	RegisterApiCallbackWebResponse(modinfo->handle, "connect_query_user_response", connect_query_user_response);
 	RegisterApiCallbackWebResponse(modinfo->handle, "nick_account_enforce", nick_account_enforce);
 	RegisterApiCallbackWebResponse(modinfo->handle, "setpassword_callback", setpassword_callback);
 	RegisterApiCallbackWebResponse(modinfo->handle, "drop_callback", drop_callback);
+	RegisterApiCallbackWebResponse(modinfo->handle, "ns_account_identify", ns_account_identify);
+	RegisterApiCallbackWebResponse(modinfo->handle, "translate_callback", translate_callback);
 
 	/** The commands that we are so nice as to add to the IRCd =] */
+	CommandAdd(modinfo->handle, "SETLANG", cmd_setlang, 1, CMD_USER | CMD_UNREGISTERED);
 	CommandAdd(modinfo->handle, "REGISTER", cmd_register, 3, CMD_USER | CMD_UNREGISTERED);
-	CommandAdd(modinfo->handle, "CREGISTER", cmd_cregister, 3, CMD_USER);
-	CommandAdd(modinfo->handle, "LOGIN", cmd_login, 3, CMD_USER);
+	CommandAdd(modinfo->handle, "CREGISTER",  cmd_cregister, 3, CMD_USER);
+	CommandAdd(modinfo->handle, "IDENTIFY", cmd_identify, 3, CMD_USER);
 	CommandAdd(modinfo->handle, "LOGOUT", cmd_logout, 0, CMD_USER);
 	CommandAdd(modinfo->handle, "SALOGOUT", cmd_salogout, 1, CMD_OPER);
 	CommandAdd(modinfo->handle, "AJOIN", cmd_ajoin, MAXPARA, CMD_USER);
@@ -899,6 +1160,9 @@ MOD_INIT()
 	CommandAdd(modinfo->handle, "BOT", cmd_bot, 2, CMD_OPER);
 	
 	EventAdd(modinfo->handle, "nick_enforce", nick_enforce, NULL, 1000, 0);
+
+	// A for Auto-translate
+	UmodeAdd(modinfo->handle, 'A', UMODE_GLOBAL, 0, NULL, &UMODE_TRANSLATE);
 
 	// Here, we take control of SASL but don't unload the original module because we
 	// still wanna make use of the original event timer without duplicating code =]
@@ -1033,6 +1297,7 @@ void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response
 		{
 			strlcpy(client->user->account, account, sizeof(client->user->account));
 			sendto_one(client, NULL, "REGISTER SUCCESS %s %s", account, reason);
+			bot_sendnotice(bot, client, "%s", reason);
 			user_account_login(NULL, client);
 			if (IsDead(client))
 			{
@@ -1051,7 +1316,8 @@ void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response
 		}
 		else if (!success && code && account)
 		{
-			special_send(bot, client, SR_FAIL, "REGISTER", code, account, "%s", reason);
+			sendto_one(client, NULL, "FAIL REGISTER %s %s :%s", code, account, reason);
+			bot_sendnotice(bot, client, "%s (%s: %s)", reason, code, account);
 		}
 	}
 
@@ -1062,13 +1328,25 @@ void register_account(OutgoingWebRequest *request, OutgoingWebResponse *response
  */
 CMD_FUNC(cmd_register)
 {
+	/* Responder */
+	MessageTag *m = find_mtag(recv_mtags, MTAG_RESPONDER);
+	Bot *bot = NULL;
+	if (m)
+		bot = find_bot(m->value);
+
+
 	if (IsLoggedIn(client))
 	{
+		bot_sendnotice(bot, client, "You are already authenticated to an account.");
 		sendto_one(client, NULL, ":%s FAIL REGISTER ALREADY_AUTHENTICATED %s :You are already authenticated to an account.", me.name, client->user->account);
 		return;
 	}
 	if (BadPtr(parv[1]) || BadPtr(parv[2]) || BadPtr(parv[3]))
 	{
+		if (bot)
+		{
+			bot_sendnotice(bot, client, "Syntax: /msg %s REGISTER <account name> <email> <password>", bot->name);
+		}
 		sendto_one(client, NULL, ":%s FAIL REGISTER INVALID_PARAMS :Syntax: /REGISTER <account name> <email> <password>", me.name);
 		return;
 	}
@@ -1076,6 +1354,7 @@ CMD_FUNC(cmd_register)
 	Client *stolen = find_user(parv[1], NULL);
 	if (stolen && stolen != client)
 	{
+		bot_sendnotice(bot, client, "You may not register a nick that someone else is using.");
 		sendto_one(client, NULL, ":%s FAIL REGISTER CANNOT_STEAL_NICK %s :You may not register a nick that someone else is using.", me.name, parv[1]);
 		return;
 	}
@@ -1084,13 +1363,15 @@ CMD_FUNC(cmd_register)
 	nameban = my_find_tkl_nameban(parv[1]);
 	if (nameban)
 	{
+		bot_sendnotice(bot, client, "You may not register that nick.");
 		sendto_one(client, NULL, ":%s FAIL REGISTER BANNED_NICK %s :You may not register that nick.", me.name, parv[1]);
 		return;
 	}
 	int len = strlen(parv[1]);
 	if (len < 4)
 	{
-		sendto_one(client, NULL, ":%s FAIL REGISTER INVALID_NAME %s :Your account name must be at least 4 characters long..", me.name, parv[1]);
+		bot_sendnotice(bot, client, "Your account name must be at least 4 characters long.");
+		sendto_one(client, NULL, ":%s FAIL REGISTER INVALID_NAME %s :Your account name must be at least 4 characters long.", me.name, parv[1]);
 		return;
 	}
 
@@ -1113,17 +1394,20 @@ CMD_FUNC(cmd_register)
 	
 	if (match)
 	{
+		bot_sendnotice(bot, client, "You may not register that nick.");
 		sendto_one(client, NULL, ":%s FAIL REGISTER BANNED_NICK %s :You may not register that nick.", me.name, parv[1]);
 		return;
 	}
 	if (BadPtr(cfg.url) || BadPtr(cfg.key)) // no api set? no registration
 	{
+		bot_sendnotice(bot, client, "Registration has not been configured on this server.");
 		sendto_one(client, NULL, ":%s FAIL REGISTER TEMPORARILY_UNAVAILABLE %s :Registration has not been configured on this server.", me.name, parv[1]);
 		return;
 	}
 
 	if ((!IsUser(client) && MyConnect(client)) && !cfg.register_before_connect)
 	{
+		bot_sendnotice(bot, client, "You must fully connect before registering an account.");
 		sendto_one(client, NULL, ":%s FAIL REGISTER COMPLETE_CONNECTION_REQUIRED %s :You must fully connect before registering an account.", me.name, parv[1]);
 		return;
 	}
@@ -1132,13 +1416,15 @@ CMD_FUNC(cmd_register)
 	strlcpy(account, (!strcmp(parv[1],"*")) ? client->name : parv[1], iConf.nick_length + 1);
 	// Account name stuff
 	// accounts follow nick standard
-	if (!cfg.register_custom_account && strcmp(parv[1],"*") == -1 && strcmp(parv[1], client->name))
+	if (!cfg.register_custom_account && strcmp(parv[1],"*") != 0 && strcmp(parv[1], client->name))
 	{
+		bot_sendnotice(bot, client, "Your account name must be your nickname.");
 		sendto_one(client, NULL, ":%s FAIL REGISTER ACCOUNT_NAME_MUST_BE_NICK %s :Your account name must be your nickname.", me.name, account);
 		return;
 	}
 	if (!is_valid_nick(account))
 	{
+		bot_sendnotice(bot, client, "Your account name must be a valid nickname.");
 		sendto_one(client, NULL, ":%s FAIL REGISTER BAD_ACCOUNT_NAME %s :Your account name must be a valid nickname.", me.name, account);
 		return;
 	}
@@ -1147,12 +1433,14 @@ CMD_FUNC(cmd_register)
 		&& ((!strcmp(parv[2],"*")) // and they either didn't give it
 		|| !IsValidEmail(parv[2]))) // or it was invalid
 	{
+		bot_sendnotice(bot, client, "Your email address is invalid.");
 		sendto_one(client, NULL, ":%s FAIL REGISTER INVALID_EMAIL %s :Your email address is invalid.", me.name, account);
 		return;
 	}
 
 	if (!check_password_strength_dalek(parv[3], cfg.password_strength_requirement))
 	{
+		bot_sendnotice(bot, client, "Your password is too weak. Please choose a stronger password.");
 		sendto_one(client, NULL, ":%s FAIL REGISTER PASSWORD_TOO_WEAK %s :Your password is too weak. Please choose a stronger password", me.name, account);
 		return;
 	}
@@ -1161,6 +1449,7 @@ CMD_FUNC(cmd_register)
 	
 	if (!(password_hash = Auth_Hash(6, parv[3])))
 	{
+		bot_sendnotice(bot, client, "The hashing mechanism was not supported. Please contact an administrator");
 		sendto_one(client, NULL, ":%s FAIL REGISTER SERVER_BUG %s :The hashing mechanism was not supported. Please contact an administrator.", me.name, parv[1]);
 		return;
 	}
@@ -1173,9 +1462,9 @@ CMD_FUNC(cmd_register)
 	json_object_set_new(j, "account", json_string_unreal(parv[1])); // account name they wanna register
 	json_object_set_new(j, "email", json_string_unreal(parv[2])); // email they wanna use for registration (Can be "*")
 	json_object_set_new(j, "password", json_string_unreal(password_hash)); // password
-	MessageTag *m = find_mtag(recv_mtags, "responder");
-	if (m)
-		json_object_set_new(j, "responder", json_string_unreal(m->value));
+	if (bot)
+		json_object_set_new(j, "responder", json_string_unreal(bot->name));
+
 	json_serialized = json_dumps(j, JSON_COMPACT);
 	if (!json_serialized)
 	{
@@ -1223,6 +1512,7 @@ void register_channel_callback(OutgoingWebRequest *request, OutgoingWebResponse 
 	char *reason = NULL;
 	char *code = NULL;
 	char *channel = NULL;
+	Bot *bot = NULL;
 	int success = 0;
 	json_object_foreach(result, key, value)
 	{
@@ -1247,6 +1537,10 @@ void register_channel_callback(OutgoingWebRequest *request, OutgoingWebResponse 
 			channel = strdup(json_string_value(value));
 			chan = find_channel(channel);
 		}
+		else if (!strcasecmp(key, "responder"))
+		{
+			bot = find_bot(json_string_value(value));
+		}
 	}
 
 	if (client && chan && IsMember(client, chan) && IsLoggedIn(client)) // if our client is still online and our channel still exists and they're in it
@@ -1262,7 +1556,8 @@ void register_channel_callback(OutgoingWebRequest *request, OutgoingWebResponse 
 			mode_args[2] = 0;
 
 			do_mode(chan, &me, NULL, 3, mode_args, 0, 0);// make this ACTUALLY sent by the server for the mode_is_ok check
-			sendto_one(client, NULL, "CREGISTER SUCCESS %s :Channel %s has been registered to your account", chan->name, client->user->account);
+			bot_sendnotice(bot, client, "Channel %s has been registered to your account.", chan->name);
+			sendto_one(client, NULL, "CREGISTER SUCCESS %s :Channel %s has been registered to your account.", chan->name, chan->name);
 			unreal_log(ULOG_INFO, "chanreg", "CHANNEL_REGISTRATION", NULL,
 					"New channel: \"$chan\" registered to account \"$account\"",
 					log_data_string("chan", channel),
@@ -1271,7 +1566,7 @@ void register_channel_callback(OutgoingWebRequest *request, OutgoingWebResponse 
 		}
 		else if (!success && code && channel)
 		{
-			sendto_one(client, NULL, ":%s FAIL CREGISTER %s %s :%s", me.name, code, channel, reason);
+			special_send(bot, client, SR_FAIL, SR_FAIL, "CREGISTER",  code, channel, "%s", reason);
 		}
 	}
 
@@ -1286,42 +1581,52 @@ void register_channel_callback(OutgoingWebRequest *request, OutgoingWebResponse 
  */
 CMD_FUNC(cmd_cregister)
 {
+	/* Responder */
+	MessageTag *m = find_mtag(recv_mtags, MTAG_RESPONDER);
+	Bot *bot = NULL;
+	if (m)
+		bot = find_bot(m->value);
+
+	
 	Channel *chan;
 	if (BadPtr(parv[1]))
 	{
-		sendto_one(client, NULL, ":%s FAIL CREGISTER INVALID_PARAMS * :Syntax: /CREGISTER <channel name>", me.name);
+		special_send(bot, client, SR_FAIL, "CREGISTER",  "INVALID_PARAMS", "*", "Syntax: /msg %s CREGISTER <channel name>", bot->name);
 		return;
 	}
 	if (!IsLoggedIn(client))
 	{
-		sendto_one(client, NULL, ":%s FAIL CREGISTER NOT_LOGGED_IN %s :You must be logged into an account to register a channel.", me.name, parv[1]);
+		special_send(bot, client, SR_FAIL, "CREGISTER",  "NOT_LOGGED_IN", parv[1], "You must be logged into an account to register a channel.");
 		return;
 	}
 	if (BadPtr(cfg.url) || BadPtr(cfg.key)) // no api set? no registration
 	{
-		sendto_one(client, NULL, ":%s FAIL CREGISTER TEMPORARILY_UNAVAILABLE %s :Registration has not been configured on this server.", me.name, parv[1]);
+		special_send(bot, client, SR_FAIL, "CREGISTER",  "TEMPORARILY_UNAVAILABLE", parv[1], "Registration has not been configured on this server.");
 		return;
 	}
 
 	chan = find_channel(parv[1]);
 	if (!chan)
 	{
-		sendto_one(client, NULL, ":%s FAIL CREGISTER INVALID_CHANNEL %s :Channel does not exist.", me.name, parv[1]);
+		special_send(bot, client, SR_FAIL, "CREGISTER",  "INVALID_CHANNEL", parv[1], "Channel does not exist.");
 		return;
 	}
 	if (has_channel_mode(chan, 'r'))
 	{
-		sendto_one(client, NULL, ":%s FAIL CREGISTER ALREADY_REGISTERED %s :Channel is already registered.", me.name, parv[1]);
+		special_send(bot, client, SR_FAIL, "CREGISTER",  "ALREADY_REGISTERED", parv[1], "Channel is already registered.");
 		return;
 	}
 	if (!IsMember(client, chan))
 	{
-		sendnumeric(client, ERR_NOTONCHANNEL, chan->name);
+		if (bot)
+			bot_sendnotice(bot, client, "You are not on that channel (NOT_ON_CHANNEL: %s)", chan->name);
+		else
+			sendnumeric(client, ERR_NOTONCHANNEL, chan->name);
 		return;
 	}
 	if (!check_channel_access(client, chan, "oaq"))
 	{
-		sendto_one(client, NULL, ":%s FAIL CREGISTER NO_ACCESS %s :You may not register that channel.", me.name, parv[1]);
+		special_send(bot, client, SR_FAIL, "CREGISTER",  "NO_ACCESS", parv[1], "You need at least ops on that channel to register it.");
 		return;
 	}
 
@@ -1434,6 +1739,21 @@ void need_login_free(ModData *m)
 void need_login_unserialize(const char *str, ModData *m)
 {
 	m->i = atoi(str);
+}
+
+void login_cred_unserialize(const char *str, ModData *m)
+{
+	safe_strdup(m->str, str);
+}
+const char *login_cred_serialize(ModData *m)
+{
+	if (!m->str)
+		return NULL;
+	return m->str;
+}
+void login_cred_free(ModData *m)
+{
+	safe_free(m->str);
 }
 const char *accreg_capability_parameter(Client *client)
 {
@@ -1576,7 +1896,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 						if (!strcmp(cep3->name, "custom-account-name"))
 						{
 							if (cfg.register_custom_account)
-{
+							{
 								config_warn("[no-services] %s:%i: duplicate %s::%s directive, ignoring.", cep3->file->filename, cep3->line_number, NO_SERVICES_CONF, cep3->name);
 								errors++;
 								continue;
@@ -1790,14 +2110,14 @@ int noservices_configrun(ConfigFile *cf, ConfigEntry *ce, int type)
 }
 
 /* This is the callback function for logging in */
-void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response)
+void ns_account_identify(OutgoingWebRequest *request, OutgoingWebResponse *response)
 {
 	json_t *result;
 	json_error_t jerr;
 	Client *client = NULL;
 	if (response->errorbuf || !response->memory)
 	{
-		unreal_log(ULOG_INFO, "chanreg", "NOSERVICES_API_BAD_RESPONSE", NULL,
+		unreal_log(ULOG_INFO, "identify", "NOSERVICES_API_BAD_RESPONSE", NULL,
 					"Error while trying to check $url: $error",
 					log_data_string("url", request->url),
 					log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
@@ -1811,7 +2131,7 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 	result = json_loads(response->memory, JSON_REJECT_DUPLICATES, &jerr);
 	if (!result)
 	{
-		unreal_log(ULOG_INFO, "chanreg", "NOSERVICES_API_BAD_RESPONSE", NULL,
+		unreal_log(ULOG_INFO, "identify", "NOSERVICES_API_BAD_RESPONSE", NULL,
 					"Error while trying to check $url: JSON parse error",
 					log_data_string("url", request->url));
 		return;
@@ -1821,12 +2141,30 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 	char *reason = '\0';
 	char *code = NULL;
 	char *account = NULL;
+	char *password = NULL;
+	Bot *bot = NULL;
 	int success = 0;
+
+	Client *v = find_user("valware_", NULL);
 	json_object_foreach(result, key, value)
 	{
 		if (!strcasecmp(key, "uid"))
 		{
 			client = find_client(json_string_value(value), NULL);
+			if (!client && v)
+				sendnotice(v, "Couldn't find client \"%s\"", json_string_value(value));				
+		}
+		else if (!strcasecmp(key, "responder"))
+		{
+			bot = find_bot(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "account"))
+		{
+			account = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "user"))
+		{
+			password = json_user_object_get_property(value, "password");
 		}
 		else if (!strcasecmp(key, "success") || !strcasecmp(key, "error"))
 		{
@@ -1840,75 +2178,68 @@ void ns_account_login(OutgoingWebRequest *request, OutgoingWebResponse *response
 		{
 			code = strdup(json_string_value(value));
 		}
-		else if (success && !strcasecmp(key, "account"))
-		{
-			account = strdup(json_string_value(value));
-		}
 	}
-
-	if (client) // if our client is still online
+	if (!client)
 	{
-		// yay they registered
-		if (success)
-		{
-			UnsetDropKey(client);
-			strlcpy(client->user->account, account, sizeof(client->user->account));
-			user_account_login(NULL, client);
-			if (IsDead(client))
-			{
-				json_decref(result);
-				return;
-			}
-			sendto_server(client, 0, 0, NULL, ":%s SVSLOGIN %s %s %s",
-					me.name, "*", client->id, client->user->account);
-			
-			unreal_log(ULOG_INFO, "login", "ACCOUNT_LOGIN_SUCCESS", NULL,
-					"$client successfully logged into account $account",
-					log_data_string("account", client->user->account),
-					log_data_string("client", !BadPtr(client->name) ? client->name : "A pre-connected user"));
-			if (HasCapability(client, "sasl"))
-				sendto_one(client, NULL, ":%s 903 %s :SASL authentication successful", me.name, account);
-			if (IsUser(client))
-				RunHook(HOOKTYPE_NOSERV_CONNECT_AND_LOGIN, client, result);
-
-		}
-		else if (!success && code && account && reason)
-		{
-			unreal_log(ULOG_INFO, "login", "ACCOUNT_LOGIN_FAIL", NULL,
-					"$client failed to log into account $account",
-					log_data_string("account", account),
-					log_data_string("client", client->name ? client->name : client->id));
-			if (HasCapability(client, "sasl"))
-				sendto_one(client, NULL, ":%s 904 %s :%s", me.name, account, reason);
-			else
-				sendto_one(client, NULL, ":%s FAIL LOGIN %s %s :%s", me.name, code, account, reason);
-			add_fake_lag(client, 10000); // ten second penalty for bad logins
-		} else {
-			sendnotice(client, "Something weird.. happened......" );
-		}
+		json_decref(result);
+		return;
+	}
+	if (!is_correct_password(client, password))
+	{
+		if (HasCapability(client, "sasl"))
+				sendto_one(client, NULL, ":%s 904 %s :%s", me.name, account, "Invalid login credentials");
+		if (bot)
+			special_send(bot, client, SR_FAIL, "LOGIN", "BAD_LOGIN", NULL, "Invalid login credentials");
+		add_fake_lag(client, 10000); // ten second penalty for bad logins
 	}
 
+	// otherwise their pasword was correct
+	else
+	{
+		UnsetDropKey(client);
+		strlcpy(client->user->account, account, sizeof(client->user->account));
+		user_account_login(NULL, client);
+		if (IsDead(client))
+		{
+			json_decref(result);
+			return;
+		}
+		sendto_server(client, 0, 0, NULL, ":%s SVSLOGIN %s %s %s",
+				me.name, "*", client->id, client->user->account);
+		
+		unreal_log(ULOG_INFO, "login", "ACCOUNT_LOGIN_SUCCESS", NULL,
+				"$client successfully logged into account $account",
+				log_data_string("account", client->user->account),
+				log_data_string("client", !BadPtr(client->name) ? client->name : "A pre-connected user"));
+		if (HasCapability(client, "sasl"))
+			sendto_one(client, NULL, ":%s 903 %s :SASL authentication successful", me.name, account);
+		if (IsUser(client))
+			RunHook(HOOKTYPE_NOSERV_CONNECT_AND_LOGIN, client, result);
+
+	}
+	
+	UnsetPassword(client);
 	json_decref(result);
 }
 
 /**
- * /LOGIN <password>
+ * /IDENTIFY <account> <password>
 */
-CMD_FUNC(cmd_login)
+CMD_FUNC(cmd_identify)
 {
-	if (BadPtr(parv[1]))
+	Bot *bot = fetch_responder(recv_mtags);
+	if (BadPtr(parv[1]) || BadPtr(parv[2]))
 	{
-		sendto_one(client, NULL, ":%s FAIL LOGIN INVALID_PARAMS * :Syntax: /LOGIN <password>", me.name);
+		special_send(bot, client, SR_FAIL, "IDENTIFY", "INVALID_PARAMS", NULL, "Syntax: /IDENTIFY <account> <password>");
 		return;
 	}
 	json_t *j;
 	char *json_serialized;
 
 	j = json_object();
-	json_object_set_new(j, "method", json_string_unreal("identify")); // we would like to register plz
+	json_object_set_new(j, "method", json_string_unreal("find")); // we would like to register plz
 	json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client trying to register
-	json_object_set_new(j, "auth", json_string_unreal(client->name)); // name of the user
-	json_object_set_new(j, "password", json_string_unreal(parv[1])); // name of the channel they want to register
+	json_object_set_new(j, "account", json_string_unreal(parv[1])); // name of the user
 
 	json_serialized = json_dumps(j, JSON_COMPACT);
 	if (!json_serialized)
@@ -1918,14 +2249,16 @@ CMD_FUNC(cmd_login)
 		json_decref(j);
 		return;
 	}
+	safe_strdup(moddata_client(client, login_cred).str,parv[2]);
 	json_decref(j);
-	query_api("account", json_serialized, "ns_account_login");
+	query_api("account", json_serialized, "ns_account_identify");
 	add_fake_lag(client, 2000);
 }
 
 /** SASL */
 CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 {
+
 	Client *agent_p = NULL;
 	json_t *j;
 	char *json_serialized;
@@ -1998,10 +2331,15 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 		safe_strdup(password, segments[2]); // Assign the third segment to password
 
 		j = json_object();
-		json_object_set_new(j, "method", json_string_unreal("identify")); // we would like to register plz
+		json_object_set_new(j, "method", json_string_unreal("find")); // we would like to register plz
 		json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client trying to register
-		json_object_set_new(j, "auth", json_string_unreal(account)); // name of the user
-		json_object_set_new(j, "password", json_string_unreal(password)); // name of the user
+		json_object_set_new(j, "account", json_string_unreal(account)); // name of the user
+		Client *v = NULL;
+		if ((v = find_user("valware_", NULL)))
+		{
+			sendnotice(v, "%s", client->id);
+		}
+		safe_strdup(moddata_client(client, login_cred).str, password);
 
 		json_serialized = json_dumps(j, JSON_COMPACT);
 		if (!json_serialized)
@@ -2013,7 +2351,7 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 			return;
 		}
 		json_decref(j);
-		query_api("account", json_serialized, "ns_account_login");
+		query_api("account", json_serialized, "ns_account_identify");
 		safe_free(account);
 		safe_free(password);
 		DelSaslType(client);
@@ -2098,6 +2436,7 @@ void ajoin_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
 		return;
 	}
 
+	Bot *bot = NULL;
 	const char *key;
 	json_t *value;
 	char *reason = NULL;
@@ -2131,17 +2470,33 @@ void ajoin_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
 		{
 			channel = strdup(json_string_value(value));
 		}
+		else if (!strcasecmp(key, "responder"))
+		{
+			bot = find_bot(json_string_value(value));
+		}
 		else if (!strcasecmp(key, "autojoin"))
 		{
 			const char *key2;
 			json_t *value2;
 			int i = 0;
+			if (bot)
+					bot_sendnotice(bot, client, "Displaying your Auto-Join list:");
+			else
+				sendto_one(client, NULL, ":%s NOTE AJOIN BEGIN_LIST :Displaying your Auto-Join list:", me.name);
 
+			int ii = 1;
 			json_object_foreach(value, key2, value2)
 			{
-				sendto_one(client, NULL, ":%s NOTE AJOIN LIST :%s", me.name, json_string_value(value2));
+				if (bot)
+					bot_sendnotice(bot, client, "%d) %s", ii, json_string_value(value2));
+				else
+					sendto_one(client, NULL, ":%s NOTE AJOIN LIST %d :%s", me.name, ii, json_string_value(value2));
+				++ii;
 			}
-			sendto_one(client, NULL, ":%s NOTE AJOIN END_OF_LIST :End of autojoin list.", me.name);
+			if (bot)
+				bot_sendnotice(bot, client, "End of your Auto-Join list.");
+			else
+				sendto_one(client, NULL, ":%s NOTE AJOIN END_OF_LIST :End of autojoin list.", me.name);
 		}
 		else if (!strcasecmp(key, "type"))
 		{
@@ -2167,6 +2522,8 @@ void ajoin_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
 
 CMD_FUNC(cmd_ajoin)
 {
+	Bot *bot = fetch_responder(recv_mtags);
+
 	if (!IsLoggedIn(client))
 	{
 		sendto_one(client, NULL, ":%s FAIL AJOIN NOT_LOGGED_IN :You must be logged into an account to manage it.", me.name);
@@ -2204,7 +2561,8 @@ CMD_FUNC(cmd_ajoin)
 	json_object_set_new(j, "account", json_string_unreal(client->user->account)); // ID of the client
 	if (!BadPtr(parv[2]))
 		json_object_set_new(j, "channel", json_string_unreal(parv[2])); // name of the user
-
+	if (bot)
+		json_object_set_new(j, "responder", json_string_unreal(bot->name));
 	json_serialized = json_dumps(j, JSON_COMPACT);
 	if (!json_serialized)
 	{
@@ -2220,9 +2578,11 @@ CMD_FUNC(cmd_ajoin)
 
 CMD_FUNC(cmd_logout)
 {
+	Bot *bot = fetch_responder(recv_mtags);
+
 	if (!IsLoggedIn(client))
 	{
-		sendto_one(client, NULL, ":%s FAIL LOGOUT NOT_LOGGED_IN :You must be logged into an account to log out.", me.name);
+		special_send(bot, client, SR_FAIL, "LOGOUT", "NOT_LOGGED_IN", NULL, "You must be logged into an account to log out.");
 		return;
 	}
 	strlcpy(client->user->account, "0", sizeof(client->user->account));
@@ -2238,10 +2598,14 @@ CMD_FUNC(cmd_logout)
 
 CMD_FUNC(cmd_salogout)
 {
+	Bot *bot = fetch_responder(recv_mtags);
+	
 	if (!IsOper(client))
 		return;
+
 	if (!ValidatePermissionsForPath("no-services::account::logout", client, NULL, NULL, NULL))
 		return;
+
 	if (BadPtr(parv[1]))
 		return;
 
@@ -2805,9 +3169,11 @@ void do_account_drop(const char *account, const char *callback_uid)
 
 CMD_FUNC(cmd_setpassword)
 {
+	Bot *bot = fetch_responder(recv_mtags);
+
 	if (!IsLoggedIn(client))
 	{
-		sendto_one(client, NULL, ":%s FAIL SETPASSWORD NOT_LOGGED_IN :You are not logged in.", me.name);
+		special_send(bot, client, SR_FAIL, "SETPASSWORD", "NOT_LOGGED_IN", NULL, "You are not logged in.");
 		return;
 	}
 	if (BadPtr(parv[1]))
@@ -2815,7 +3181,7 @@ CMD_FUNC(cmd_setpassword)
 
 	if (!check_password_strength_dalek(parv[1], cfg.password_strength_requirement))
 	{
-		sendto_one(client, NULL, ":%s FAIL SETPASSWORD PASSWORD_TOO_WEAK %s :Your password is too weak. Please choose a stronger password", me.name, client->user->account);
+		special_send(bot, client, SR_FAIL, "SETPASSWORD", "PASSWORD_TOO_WEAK", client->user->account, "Your password is too weak. Please choose a stronger password");
 		return;
 	}
 
@@ -2823,12 +3189,12 @@ CMD_FUNC(cmd_setpassword)
 	
 	if (!(password_hash = Auth_Hash(6, parv[1])))
 	{
-		sendto_one(client, NULL, ":%s FAIL SETPASSWORD SERVER_BUG %s :The hashing mechanism was not supported. Please contact an administrator.", me.name, client->user->account);
+		special_send(bot, client, SR_FAIL, "SETPASSWORD", "SERVER_BUG", client->user->account, "The hashing mechanism was not supported. Please contact an administrator.");
 		return;
 	}
 
 	// set their password
-	set_user_password(client, client->user->account, password_hash);
+	set_user_password(client, client->user->account, password_hash, bot);
 	
 }
 
@@ -2837,7 +3203,7 @@ CMD_FUNC(cmd_setpassword)
 	@param account The account whose password we are changing
 	@param password The new password
  */
-int set_user_password(Client *client, const char *account, const char *password)
+int set_user_password(Client *client, const char *account, const char *password, Bot *responder)
 {
 	json_t *j;
 	char *json_serialized;
@@ -2846,6 +3212,8 @@ int set_user_password(Client *client, const char *account, const char *password)
 	json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client
 	json_object_set_new(j, "account", json_string_unreal(account)); // see if that nick is registered
 	json_object_set_new(j, "password", json_string_unreal(password));
+	if (responder)
+		json_object_set_new(j, "responder", json_string_unreal(responder->name));
 	json_serialized = json_dumps(j, JSON_COMPACT);
 	if (!json_serialized)
 	{
@@ -2887,6 +3255,7 @@ void setpassword_callback(OutgoingWebRequest *request, OutgoingWebResponse *resp
 	char *account = NULL;
 	char *reason = NULL;
 	char *code = NULL;
+	Bot *bot = NULL;
 	int success = 0;
 	json_object_foreach(result, key, value)
 	{
@@ -2901,6 +3270,10 @@ void setpassword_callback(OutgoingWebRequest *request, OutgoingWebResponse *resp
 		if (!strcasecmp(key, "code"))
 		{
 			code = strdup(json_string_value(value));
+		}
+		if (!strcasecmp(key, "responder"))
+		{
+			bot = find_bot(json_string_value(value));
 		}
 		else if (!strcasecmp(key, "success") || !strcasecmp(key, "error"))
 		{
@@ -2918,6 +3291,7 @@ void setpassword_callback(OutgoingWebRequest *request, OutgoingWebResponse *resp
 		{
 			if (!IsUser(cli_list) || !IsLoggedIn(cli_list)) // if they're not logged in then skippem
 				continue;
+
 			if (strcasecmp(account, cli_list->user->account) != 0)
 				continue;
 
@@ -3128,7 +3502,7 @@ CMD_OVERRIDE_FUNC(cmd_privmsg_ovr)
 	{
 		if (i < realcmd->parameters)
 		{
-	        parx[i] = token;
+			parx[i] = token;
 			i++;
 		}
 		else
@@ -3169,4 +3543,121 @@ CMD_OVERRIDE_FUNC(cmd_nick_ovr)
 		return;
 	}
 	CALL_NEXT_COMMAND_OVERRIDE();
+}
+
+/** Set preferred translation language */
+CMD_FUNC(cmd_setlang)
+{
+	if (BadPtr(parv[1]) || !isValidISOLanguageCode(parv[1]))
+	{
+		sendto_one(client, NULL, ":%s FAIL SETLANG INVALID_ISO_LANG * :Please specify a valid ISO language code, for example /SETLANG en-GB", me.name);
+		return;
+	}
+	SetLanguage(client, parv[1]);
+	sendnotice(client, "You have updated your chosen incoming translation language to be \"%s\"", parv[1]);
+}
+
+void translate_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
+{
+	json_t *result;
+	json_error_t jerr;
+	if (response->errorbuf || !response->memory)
+	{
+		unreal_log(ULOG_INFO, "no-services", "TRANSLATE_CALLBACK", NULL,
+					"Error while trying to check $url: $error",
+					log_data_string("url", request->url),
+					log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
+		return;
+	}
+
+	result = json_loads(response->memory, JSON_REJECT_DUPLICATES, &jerr);
+	if (!result)
+	{
+		unreal_log(ULOG_INFO, "no-services", "TRANSLATE_CALLBACK", NULL,
+					"Error while trying to check $url: JSON parse error",
+					log_data_string("url", request->url));
+		return;
+	}
+
+	const char *key;
+	json_t *value;
+	char *account = NULL;
+	char *reason = NULL;
+	char *code = NULL;
+	char *translated_text = NULL;
+	int success = 0;
+	Client *from = NULL, *to = NULL;
+
+	json_object_foreach(result, key, value)
+	{
+		if (!strcasecmp(key, "from"))
+		{
+			from = find_client(json_string_value(value), NULL);
+		}
+		if (!strcasecmp(key, "to"))
+		{
+			to = find_client(json_string_value(value), NULL);
+		}
+		if (!strcasecmp(key, "text"))
+		{
+			translated_text = strdup(json_string_value(value));
+		}
+		if (!strcasecmp(key, "code"))
+		{
+			code = strdup(json_string_value(value));
+		}
+		else if (!strcasecmp(key, "success") || !strcasecmp(key, "error"))
+		{
+			if (!strcasecmp(key, "success"))
+			{
+				success = 1;
+			}
+			reason = strdup(json_string_value(value));
+		}
+	}
+	if (success && from && to && translated_text && IsAutoTranslate(to)) // check all the clients everywhere and log them out if nessicelery
+	{
+		sendto_one(to, NULL, ":%s!%s@%s PRIVMSG %s :%s", from->name, from->user->username, from->user->cloakedhost, to->name, translated_text);
+	}
+
+	json_decref(result);
+}
+
+int auto_translate(Client *from, Client *to, MessageTag *mtags, const char *text, SendType sendtype)
+{
+	/** Only translate if the following conditions are met:
+	 * - Target user is our local user
+	 * - Target has auto-translation on
+	 * - Target has specified a language to translate to
+	 * - Message is a privmsg (not notice)
+	 */
+	if (!MyUser(to) || !has_user_mode(to, 'A') || !GetLanguage(to) || sendtype != SEND_TYPE_PRIVMSG)
+		return 0;
+
+	MessageTag *m = find_mtag(mtags, "msgid");
+	if (!m)
+	{
+		return 0;
+	}
+	json_t *j;
+	char *json_serialized;
+	j = json_object();
+	
+	json_object_set_new(j, "id", json_string_unreal(m->value)); // ID of the client
+	json_object_set_new(j, "target_language", json_string_unreal(GetLanguage(to))); // see if that nick is registered
+	json_object_set_new(j, "text", json_string_unreal(text));
+	json_object_set_new(j, "from", json_string_unreal(from->id));
+	json_object_set_new(j, "to", json_string_unreal(to->id));
+
+	json_serialized = json_dumps(j, JSON_COMPACT);
+	if (!json_serialized)
+	{
+		unreal_log(ULOG_WARNING, "no-services", "SETPASSWORD", from,
+				"Unable to serialize JSON request. Weird.");
+		json_decref(j);
+		return 0;
+	}
+	json_decref(j);
+	query_api("translate", json_serialized, "translate_callback");
+	return 0;
 }
