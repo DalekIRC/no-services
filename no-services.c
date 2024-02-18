@@ -2,7 +2,7 @@
   Licence: GPLv3
   Copyright Ⓒ 2024 Valerie Pond
   */
-#define NOSERVICES_VERSION "1.3.0"
+#define NOSERVICES_VERSION "1.3.1"
 
 /*** <<<MODULE MANAGER START>>>
 module
@@ -193,11 +193,44 @@ CMD_FUNC(cmd_setpassword);
 CMD_FUNC(cmd_sadrop);
 CMD_FUNC(cmd_tban);
 CMD_FUNC(cmd_bot);
+CMD_FUNC(cmd_access);
 
 EVENT(nick_enforce);
 
 int responder_is_ok(Client *client, const char *name, const char *value);
 
+// case insensitive version of strstr()
+char *strcasestr(const char* haystack, const char* needle) {
+    if (*needle == '\0') {
+        return (char*) haystack; // Empty needle, return the haystack
+    }
+
+    while (*haystack != '\0') {
+        // Find the first character of the needle in the haystack
+        while (toupper(*haystack) != toupper(*needle)) {
+            if (*haystack == '\0') {
+                return NULL; // Reached the end of the haystack without finding the needle
+            }
+            haystack++;
+        }
+
+        // Compare the rest of the needle and the corresponding part of the haystack
+        const char* h = haystack;
+        const char* n = needle;
+        while (toupper(*h) == toupper(*n)) {
+            if (*n == '\0') {
+                return (char*) haystack; // Found the needle in the haystack
+            }
+            h++;
+            n++;
+        }
+        
+        // Continue searching in the haystack
+        haystack++;
+    }
+
+    return NULL; // Needle not found
+}
 char *json_user_object_get_property(json_t *user_obj, const char *property_name)
 {
 	const char *key;
@@ -718,9 +751,10 @@ void rehash_check_bline(void)
 			int n;
 
 			/* for new_message() we use target here, makes sense for the exit_client, right? */
-			sendto_server(NULL, 0, 0, NULL, ":%s SVSKILL %s :%s", me.name, cptr->id, comment);
+			if (!MyConnect(cptr))
+				sendto_server(NULL, 0, 0, NULL, ":%s SVSKILL %s :%s", me.name, cptr->id, comment);
 			SetKilled(cptr);
-			exit_client(cptr, NULL, comment);
+			dead_socket(cptr, comment);
 		}
 	}
 }
@@ -782,6 +816,10 @@ TKL *my_find_tkl_nameban(const char *name)
 	return NULL;
 }
 
+/** Checks the strength of a given password
+ * @param password The password to check
+ * @param int Value between 0 and 4, 0 = no validation, 4 = require a very strong password
+*/
 int check_password_strength_dalek(const char *password, int password_strength_requirement)
 {
 	int length = strlen(password);
@@ -813,12 +851,30 @@ int check_password_strength_dalek(const char *password, int password_strength_re
 	}
 }
 
+/** special send()
+ * This function lets you send one thing to a user in two different manners depending on whether
+ * there is a bot required to reply to the user, the latter being a fallback for the former: 
+ * 1) The first way is via a bot which is defined by config. This sends a notice to the user just like classic services.
+ * 2) The second way is via IRCv3 Standard Replies.
+ *
+ * @param from The Bot struct to send the notice from. (Can be NULL for forced Standard Replies.)
+ * @param to The client to send the message to.
+ * @param success 0 = Fail, 1 = Warn, 2 = NOTE (Not shown in bot notices)
+ * @param cmd The command the user tried to issue (Not shown in bot notices)
+ * @param msg The associated error code/message (NOT_ON_CHANNEL, INVALID_EMAIL, etc)
+ * @param extra Any extra data to show to the client, such as any parameters they might have passed
+ * @param pattern The human-readible format string/pattern to use (e.g.: "That email address is invalid :%s")
+ * @returns Returns nothing
+*/
 void special_send(Bot *from, Client *to, int success, const char *cmd, const char *msg, const char *extra, FORMAT_STRING(const char *pattern), ...)
 {
 	va_list vl;
 	
 	char buffer[512];
 	char sreply[5];
+
+	if (strstr(cmd, " ") || strstr(msg, " ")) // no spaces allowed
+		return;
 
 	if (!success)
 		snprintf(sreply, sizeof(sreply), "%s", "FAIL");
@@ -843,13 +899,11 @@ void special_send(Bot *from, Client *to, int success, const char *cmd, const cha
 	va_end(vl);
 }
 
-void v_log(const char *str)
-{
-	Client *v = NULL;
-	if ((v = find_user("valware_", NULL)))
-		sendnotice(v, "%s", str);
-}
-
+/** Check a client's stored password against a hash
+ * @param client The client whose password to check
+ * @param hash The hash to check against
+ * @returns Boolean
+ */
 bool is_correct_password(Client *client, const char *hash)
 {
 	if (!client)
@@ -868,7 +922,11 @@ bool is_correct_password(Client *client, const char *hash)
 	return false;
 }
 
-// checks the validity of nicks
+
+/** checks the validity of nicks
+ * @param nick The nick to check
+ * @returns Boolean
+*/
 bool is_valid_nick(const char *nick)
 {
 	// Check if the nickname is not NULL
@@ -908,6 +966,7 @@ bool is_valid_nick(const char *nick)
  @param endpoint The endpoint of the API
  @param body The body to POST, typically JSON
  @param callback The callback function
+ @returns Void
 */
 void query_api(const char *endpoint, char *body, const char *callback)
 {
@@ -928,6 +987,7 @@ void query_api(const char *endpoint, char *body, const char *callback)
 	free(our_url);
 }
 
+// basically strncat but with a new char in memorayyy
 char *construct_url(const char *base_url, const char *extra_params)
 {
 	size_t base_len = strlen(base_url) +1;
@@ -950,19 +1010,34 @@ char *construct_url(const char *base_url, const char *extra_params)
 	}
 	return url;
 }
+
+/** Fetches a Bot struct of the intended responder to a command from MessageTag list
+ * @param recv_mtags A MessageTag linked list to search for a responder
+ * @returns A bot struct of the bot agent found in the MessageTag list
+*/
 Bot *fetch_responder(MessageTag *recv_mtags)
 {
 	MessageTag *m = find_mtag(recv_mtags, MTAG_RESPONDER);
 	return (m) ? find_bot(m->value) : NULL;
 }
+
+/** Sets a new password for the account
+ * @param client The client issuing the password change
+ * @param account The name of the account to change in case it's an admin changing someones password for them or something
+ * @param password The hash of the password (not the actual password itself) to update with.
+ * @param responder The bot agent responsible for replying to this request after our callback later
+ * @returns 1 on success, 0 on failure
+*/
+int set_user_password(Client *client, const char *account, const char *password, Bot *responder);
+
+/** Send a static char help thing like ajoin_help */
 static void display_halp(Client *client, char **helptext)
 {
 	for(; *helptext != NULL; helptext++)
 		sendto_one(client, NULL, ":%s 304 %s :%s", me.name, client->name, *helptext);
 }
 
-int set_user_password(Client *client, const char *account, const char *password, Bot *responder);
-
+/** The help output for /AJOIN */
 static char *ajoin_help[] = {
 	"***** AJOIN (Auto-Join) HELP *****",
 	"-",
@@ -1000,6 +1075,7 @@ ModuleHeader MOD_HEADER
 	"unrealircd-6",
 };
 
+/** Initialize the module! */
 MOD_INIT()
 {
 	MessageTagHandlerInfo mtag;
@@ -1158,6 +1234,7 @@ MOD_INIT()
 	CommandAdd(modinfo->handle, "SADROP", cmd_sadrop, 2, CMD_OPER);
 	CommandAdd(modinfo->handle, "SETPASSWORD", cmd_setpassword, 2, CMD_USER);
 	CommandAdd(modinfo->handle, "BOT", cmd_bot, 2, CMD_OPER);
+	CommandAdd(modinfo->handle, "ACCESS", cmd_access, 5, CMD_USER);
 	
 	EventAdd(modinfo->handle, "nick_enforce", nick_enforce, NULL, 1000, 0);
 
@@ -1908,7 +1985,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 						if (!strcmp(cep3->name, "email-required"))
 						{
 							if (cfg.register_email_required)
-{
+							{
 								config_warn("[no-services] %s:%i: duplicate %s::%s directive, ignoring.", cep3->file->filename, cep3->line_number, NO_SERVICES_CONF, cep3->name);
 								errors++;
 								continue;
@@ -1923,7 +2000,7 @@ int noservices_configtest(ConfigFile *cf, ConfigEntry *ce, int type, int *errs)
 				else if (!strcmp(cep2->name, "password-strength"))
 				{
 					if (cfg.got_password_strength_requirement)
-{
+					{
 						config_warn("[no-services] %s:%i: duplicate %s::%s directive, ignoring.", cep2->file->filename, cep2->line_number, NO_SERVICES_CONF, cep2->name);
 						errors++;
 						continue;
@@ -2145,14 +2222,11 @@ void ns_account_identify(OutgoingWebRequest *request, OutgoingWebResponse *respo
 	Bot *bot = NULL;
 	int success = 0;
 
-	Client *v = find_user("valware_", NULL);
 	json_object_foreach(result, key, value)
 	{
 		if (!strcasecmp(key, "uid"))
 		{
-			client = find_client(json_string_value(value), NULL);
-			if (!client && v)
-				sendnotice(v, "Couldn't find client \"%s\"", json_string_value(value));				
+			client = find_client(json_string_value(value), NULL);			
 		}
 		else if (!strcasecmp(key, "responder"))
 		{
@@ -2331,14 +2405,9 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 		safe_strdup(password, segments[2]); // Assign the third segment to password
 
 		j = json_object();
-		json_object_set_new(j, "method", json_string_unreal("find")); // we would like to register plz
-		json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client trying to register
-		json_object_set_new(j, "account", json_string_unreal(account)); // name of the user
-		Client *v = NULL;
-		if ((v = find_user("valware_", NULL)))
-		{
-			sendnotice(v, "%s", client->id);
-		}
+		json_object_set_new(j, "method", json_string_unreal("find"));
+		json_object_set_new(j, "uid", json_string_unreal(client->id));
+		json_object_set_new(j, "account", json_string_unreal(account));
 		safe_strdup(moddata_client(client, login_cred).str, password);
 
 		json_serialized = json_dumps(j, JSON_COMPACT);
@@ -2354,7 +2423,6 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 		query_api("account", json_serialized, "ns_account_identify");
 		safe_free(account);
 		safe_free(password);
-		DelSaslType(client);
 	}
 	else if (GetSaslType(client) == SASL_TYPE_EXTERNAL)
 	{
@@ -3135,6 +3203,9 @@ CMD_FUNC(cmd_drop)
 	sendto_one(client, NULL, ":%s DROP * INCORRECT_CODE %s :The code you entered was incorrect.", me.name, client->user->account);	
 }
 
+/** Command /SADROP
+
+*/
 CMD_FUNC(cmd_sadrop)
 {
 	if (!IsOper(client) || BadPtr(parv[1]))
@@ -3146,6 +3217,7 @@ CMD_FUNC(cmd_sadrop)
 	do_account_drop(parv[1], client->id);
 }
 
+/** Web API Call for dropping accounts */
 void do_account_drop(const char *account, const char *callback_uid)
 {
 	json_t *j;
@@ -3167,6 +3239,10 @@ void do_account_drop(const char *account, const char *callback_uid)
 	query_api("account", json_serialized, "drop_callback");
 }
 
+/** /SETPASSWORD
+	Allows a user to set their password
+	parv[1] = new password
+*/
 CMD_FUNC(cmd_setpassword)
 {
 	Bot *bot = fetch_responder(recv_mtags);
@@ -3198,11 +3274,7 @@ CMD_FUNC(cmd_setpassword)
 	
 }
 
-/** This function changes the password for an account.
-	@param client The client who initiated the password change, be it the owner or staff member
-	@param account The account whose password we are changing
-	@param password The new password
- */
+/** Wep API call for /SETPASSWORD */
 int set_user_password(Client *client, const char *account, const char *password, Bot *responder)
 {
 	json_t *j;
@@ -3227,6 +3299,8 @@ int set_user_password(Client *client, const char *account, const char *password,
 	return 1;
 }
 
+
+/** Callback function for /SETPASSWORD */
 void setpassword_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
 {
 	json_t *result;
@@ -3545,7 +3619,9 @@ CMD_OVERRIDE_FUNC(cmd_nick_ovr)
 	CALL_NEXT_COMMAND_OVERRIDE();
 }
 
-/** Set preferred translation language */
+/** Set preferred translation language
+	parv[1] = language code
+*/
 CMD_FUNC(cmd_setlang)
 {
 	if (BadPtr(parv[1]) || !isValidISOLanguageCode(parv[1]))
@@ -3557,6 +3633,8 @@ CMD_FUNC(cmd_setlang)
 	sendnotice(client, "You have updated your chosen incoming translation language to be \"%s\"", parv[1]);
 }
 
+
+/** Translation callback function */
 void translate_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
 {
 	json_t *result;
@@ -3586,6 +3664,7 @@ void translate_callback(OutgoingWebRequest *request, OutgoingWebResponse *respon
 	char *code = NULL;
 	char *translated_text = NULL;
 	int success = 0;
+	char *detected_lang = NULL;
 	Client *from = NULL, *to = NULL;
 
 	json_object_foreach(result, key, value)
@@ -3597,6 +3676,10 @@ void translate_callback(OutgoingWebRequest *request, OutgoingWebResponse *respon
 		if (!strcasecmp(key, "to"))
 		{
 			to = find_client(json_string_value(value), NULL);
+		}
+		if (!strcasecmp(key, "source"))
+		{
+			detected_lang = strdup(json_string_value(value));
 		}
 		if (!strcasecmp(key, "text"))
 		{
@@ -3615,14 +3698,19 @@ void translate_callback(OutgoingWebRequest *request, OutgoingWebResponse *respon
 			reason = strdup(json_string_value(value));
 		}
 	}
-	if (success && from && to && translated_text && IsAutoTranslate(to)) // check all the clients everywhere and log them out if nessicelery
+	if (success && from && to && translated_text && IsAutoTranslate(to))
 	{
-		sendto_one(to, NULL, ":%s!%s@%s PRIVMSG %s :%s", from->name, from->user->username, from->user->cloakedhost, to->name, translated_text);
+		// only send to them if we couldn't auto-detect their language, or if we know the auto-detected language is already their language
+		if ((!detected_lang && GetLanguage(to)) || ((detected_lang && GetLanguage(to)) && !strcasestr(GetLanguage(to), detected_lang)))
+			sendto_one(to, NULL, ":%s!%s@%s PRIVMSG %s :%s", from->name, from->user->username, from->user->cloakedhost, to->name, translated_text);
 	}
 
 	json_decref(result);
 }
 
+/** HOOKTYPE_USERMSG
+	This will automatically translate incoming messages to your chosen language
+*/
 int auto_translate(Client *from, Client *to, MessageTag *mtags, const char *text, SendType sendtype)
 {
 	/** Only translate if the following conditions are met:
@@ -3652,7 +3740,7 @@ int auto_translate(Client *from, Client *to, MessageTag *mtags, const char *text
 	json_serialized = json_dumps(j, JSON_COMPACT);
 	if (!json_serialized)
 	{
-		unreal_log(ULOG_WARNING, "no-services", "SETPASSWORD", from,
+		unreal_log(ULOG_WARNING, "no-services", "AUTOTRANSLATE", from,
 				"Unable to serialize JSON request. Weird.");
 		json_decref(j);
 		return 0;
@@ -3660,4 +3748,53 @@ int auto_translate(Client *from, Client *to, MessageTag *mtags, const char *text
 	json_decref(j);
 	query_api("translate", json_serialized, "translate_callback");
 	return 0;
+}
+
+
+CMD_FUNC(cmd_access)
+{
+	Client *target;
+	MessageTag *m = find_mtag(recv_mtags, MTAG_RESPONDER);
+	Bot *bot = NULL;
+	const char *type = NULL, *level = NULL;
+	const char *account_to_modify = NULL;
+
+	if (m)
+		bot = find_bot(m->value);
+
+	if (BadPtr(parv[1]) || BadPtr(parv[2]) || BadPtr(parv[3]))
+	{
+		special_send(bot, client, SR_FAIL, "ACCESS", "NEED_MORE_PARAMS", NULL, "Syntax: ACCESS <chan> <add|del|list> [<account> [<level]]");
+		return;
+	}
+	if (!BadPtr(parv[3]))
+		type = parv[3];
+	if (!BadPtr(parv[4]))
+		account_to_modify = parv[4];
+	if (!BadPtr(parv[5]))
+		level = parv[5];
+
+	json_t *j;
+	char *json_serialized;
+	j = json_object();
+	
+	json_object_set_new(j, "id", json_string_unreal(client->id));
+	json_object_set_new(j, "method", json_string_unreal("access")); // ID of the client
+	json_object_set_new(j, "type", json_string_unreal(type)); // see if that nick is registered
+	if (account_to_modify)
+		json_object_set_new(j, "account_to_modify", json_string_unreal(account_to_modify));
+	if (level)
+		json_object_set_new(j, "level", json_string_unreal(level));
+	if (bot)
+		json_object_set_new(j, "responder", json_string_unreal(bot->name));
+	json_serialized = json_dumps(j, JSON_COMPACT);
+	if (!json_serialized)
+	{
+		unreal_log(ULOG_WARNING, "no-services", "ACCESS", client,
+				"Unable to serialize JSON request. Weird.");
+		json_decref(j);
+		return;
+	}
+	json_decref(j);
+	query_api("channel", json_serialized, "access_callback");
 }
