@@ -2,7 +2,7 @@
   Licence: GPLv3
   Copyright Ⓒ 2024 Valerie Pond
   */
-#define NOSERVICES_VERSION "1.3.1"
+#define NOSERVICES_VERSION "1.3.1.1"
 
 /*** <<<MODULE MANAGER START>>>
 module
@@ -2194,7 +2194,7 @@ void ns_account_identify(OutgoingWebRequest *request, OutgoingWebResponse *respo
 	Client *client = NULL;
 	if (response->errorbuf || !response->memory)
 	{
-		unreal_log(ULOG_INFO, "identify", "NOSERVICES_API_BAD_RESPONSE", NULL,
+		unreal_log(ULOG_INFO, "no-services", "NOSERVICES_API_BAD_RESPONSE", NULL,
 					"Error while trying to check $url: $error",
 					log_data_string("url", request->url),
 					log_data_string("error", response->errorbuf ? response->errorbuf : "No data (body) returned"));
@@ -2208,7 +2208,7 @@ void ns_account_identify(OutgoingWebRequest *request, OutgoingWebResponse *respo
 	result = json_loads(response->memory, JSON_REJECT_DUPLICATES, &jerr);
 	if (!result)
 	{
-		unreal_log(ULOG_INFO, "identify", "NOSERVICES_API_BAD_RESPONSE", NULL,
+		unreal_log(ULOG_INFO, "no-services", "NOSERVICES_API_BAD_RESPONSE", NULL,
 					"Error while trying to check $url: JSON parse error",
 					log_data_string("url", request->url));
 		return;
@@ -2258,7 +2258,7 @@ void ns_account_identify(OutgoingWebRequest *request, OutgoingWebResponse *respo
 		json_decref(result);
 		return;
 	}
-	if (!is_correct_password(client, password))
+	if (GetSaslType(client) != SASL_TYPE_EXTERNAL && !is_correct_password(client, password))
 	{
 		if (HasCapability(client, "sasl"))
 				sendto_one(client, NULL, ":%s 904 %s :%s", me.name, account, "Invalid login credentials");
@@ -2267,7 +2267,7 @@ void ns_account_identify(OutgoingWebRequest *request, OutgoingWebResponse *respo
 		add_fake_lag(client, 10000); // ten second penalty for bad logins
 	}
 
-	// otherwise their pasword was correct
+	// otherwise their pasword was correct or they used EXTERNAL
 	else
 	{
 		UnsetDropKey(client);
@@ -2291,7 +2291,7 @@ void ns_account_identify(OutgoingWebRequest *request, OutgoingWebResponse *respo
 			RunHook(HOOKTYPE_NOSERV_CONNECT_AND_LOGIN, client, result);
 
 	}
-	
+	DelSaslType(client);
 	UnsetPassword(client);
 	json_decref(result);
 }
@@ -2356,6 +2356,11 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 	if (client->user == NULL)
 		make_user(client);
 
+	if ((!strcasecmp(parv[1], "PLAIN") || !strcasecmp(parv[1], "EXTERNAL")) && GetSaslType(client))
+	{
+		sendnotice(client, "[error] Previous AUTHENTICATE request still processing...");
+		return;
+	}
 	if (!strcasecmp(parv[1], "PLAIN"))
 	{
 		SetSaslType(client, SASL_TYPE_PLAIN);
@@ -2436,9 +2441,9 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 			DelSaslType(client);
 			return;
 		}
-		json_object_set_new(j, "method", json_string_unreal("identify cert")); // we would like to register plz
-		json_object_set_new(j, "uid", json_string_unreal(client->id)); // ID of the client trying to register
-		json_object_set_new(j, "cert", json_string_unreal(moddata_client(client, moddata).str)); // cert to lookup
+		json_object_set_new(j, "method", json_string_unreal("find by cert"));
+		json_object_set_new(j, "uid", json_string_unreal(client->id));
+		json_object_set_new(j, "cert", json_string_unreal(moddata_client(client, moddata).str));
 
 		json_serialized = json_dumps(j, JSON_COMPACT);
 		if (!json_serialized)
@@ -2451,7 +2456,7 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 			return;
 		}
 		json_decref(j);
-		query_api("account", json_serialized, "ns_account_login");
+		query_api("account", json_serialized, "ns_account_identify");
 	}
 	DelSaslType(client);
 }
@@ -2968,7 +2973,7 @@ void certfp_callback(OutgoingWebRequest *request, OutgoingWebResponse *response)
 		sendto_one(client, NULL, ":%s NOTE CERTFP UPDATE_SUCCESSFUL %s :You have successfully updated your Certificate Fingerprint list.", me.name, cert);
 
 	else if (client && !success && code && reason)
-		sendto_one(client, NULL, ":%s FAIL CERTFP %s %s :%s", me.name, code, cert, reason);
+		sendto_one(client, NULL, ":%s FAIL CERTFP %s * :%s", me.name, code, reason);
 
 	json_decref(result);
 }
