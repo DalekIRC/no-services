@@ -2261,7 +2261,7 @@ void ns_account_identify(OutgoingWebRequest *request, OutgoingWebResponse *respo
 	if (GetSaslType(client) != SASL_TYPE_EXTERNAL && !is_correct_password(client, password))
 	{
 		if (HasCapability(client, "sasl"))
-				sendto_one(client, NULL, ":%s 904 %s :%s %d", me.name, account, "Invalid login credentials", GetSaslType(client));
+				sendto_one(client, NULL, ":%s 904 %s :%s", me.name, account, "Invalid login credentials");
 		if (bot)
 			special_send(bot, client, SR_FAIL, "LOGIN", "BAD_LOGIN", NULL, "Invalid login credentials");
 		add_fake_lag(client, 10000); // ten second penalty for bad logins
