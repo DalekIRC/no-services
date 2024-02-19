@@ -2,7 +2,7 @@
   Licence: GPLv3
   Copyright Ⓒ 2024 Valerie Pond
   */
-#define NOSERVICES_VERSION "1.3.1.1"
+#define NOSERVICES_VERSION "1.3.1.2"
 
 /*** <<<MODULE MANAGER START>>>
 module
@@ -2261,7 +2261,7 @@ void ns_account_identify(OutgoingWebRequest *request, OutgoingWebResponse *respo
 	if (GetSaslType(client) != SASL_TYPE_EXTERNAL && !is_correct_password(client, password))
 	{
 		if (HasCapability(client, "sasl"))
-				sendto_one(client, NULL, ":%s 904 %s :%s", me.name, account, "Invalid login credentials");
+				sendto_one(client, NULL, ":%s 904 %s :%s %d", me.name, account, "Invalid login credentials", GetSaslType(client));
 		if (bot)
 			special_send(bot, client, SR_FAIL, "LOGIN", "BAD_LOGIN", NULL, "Invalid login credentials");
 		add_fake_lag(client, 10000); // ten second penalty for bad logins
@@ -2358,7 +2358,7 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 
 	if ((!strcasecmp(parv[1], "PLAIN") || !strcasecmp(parv[1], "EXTERNAL")) && GetSaslType(client))
 	{
-		sendnotice(client, "[error] Previous AUTHENTICATE request still processing...");
+		sendnotice(client, "[error] Previous AUTHENTICATE request still in progress.");
 		return;
 	}
 	if (!strcasecmp(parv[1], "PLAIN"))
@@ -2458,7 +2458,6 @@ CMD_OVERRIDE_FUNC(cmd_authenticate_ovr)
 		json_decref(j);
 		query_api("account", json_serialized, "ns_account_identify");
 	}
-	DelSaslType(client);
 }
 
 int sasl_capability_visible(Client *client)
