@@ -2,7 +2,7 @@
   Licence: GPLv3
   Copyright Ⓒ 2024 Valerie Pond
   */
-#define NOSERVICES_VERSION "1.3.1.2"
+#define NOSERVICES_VERSION "1.3.1.3"
 
 /*** <<<MODULE MANAGER START>>>
 module
@@ -198,6 +198,8 @@ CMD_FUNC(cmd_access);
 EVENT(nick_enforce);
 
 int responder_is_ok(Client *client, const char *name, const char *value);
+
+
 
 // case insensitive version of strstr()
 char *strcasestr(const char* haystack, const char* needle) {
@@ -761,42 +763,10 @@ void rehash_check_bline(void)
 /** "Test" the "validity" of emails*/
 int IsValidEmail(const char *str)
 {
-	int i = 0;
-	int atCount = 0;
-	int dotCount = 0;
-
-	// Check if the string is empty
-	if (str[0] == '\0')
+	if (!strstr(str, "@"))
 		return 0;
-
-	// Validate characters before '@'
-	while (str[i] != '@') {
-		char c = str[i];
-		if (!(isalnum(c) || c == '.' || c == '_' || c == '%' || c == '-'))
-			return 0;
-		i++;
-	}
-	if (i == 0 || str[i - 1] == '.' || str[i - 1] == '_' || str[i - 1] == '%' || str[i - 1] == '-')
+	if (!strstr(str, "."))
 		return 0;
-
-	// Validate characters after '@'
-	i++; // Skip '@'
-	while (str[i] != '\0' && str[i] != '.') {
-		char c = str[i];
-		if (!(isalnum(c) || c == '.' || c == '-' ))
-			return 0;
-		i++;
-	}
-	if (i == 0 || str[i - 1] == '.' || str[i - 1] == '-')
-		return 0;
-
-	// Validate characters after '.'
-	while (str[i] != '\0') {
-		char c = str[i];
-		if (!(isalpha(c)))
-			return 0;
-		i++;
-	}
 
 	return 1;
 }
@@ -886,10 +856,10 @@ void special_send(Bot *from, Client *to, int success, const char *cmd, const cha
 		snprintf(sreply, sizeof(sreply), "%s", "NOTE");
 
 	// Use snprintf to modify the string in the buffer
-	if (from != NULL)
+	if (from)
 		snprintf(buffer, sizeof(buffer), ":%s!%s@%s NOTICE %s :%s (%s: %s)", from->name, from->name, me.name, to->name, pattern, msg, (extra) ? extra : "*");
 	else
-		snprintf(buffer, sizeof(buffer), ":%s %s %s %s %s :%s", me.name, sreply, cmd, msg, (extra) ? extra : "*", pattern);
+		snprintf(buffer, sizeof(buffer), ":%s %s %s %s %s :%s", me.name, sreply, cmd, msg, ((extra)) ? extra : "*", pattern);
 
 	// Use the same buffer for the new const char*
 	const char* newString = buffer;
@@ -1511,7 +1481,7 @@ CMD_FUNC(cmd_register)
 		|| !IsValidEmail(parv[2]))) // or it was invalid
 	{
 		bot_sendnotice(bot, client, "Your email address is invalid.");
-		sendto_one(client, NULL, ":%s FAIL REGISTER INVALID_EMAIL %s :Your email address is invalid.", me.name, account);
+		sendto_one(client, NULL, ":%s FAIL REGISTER INVALID_EMAIL %s :Your email address is invalid.", me.name, parv[2]);
 		return;
 	}
 
@@ -2268,7 +2238,7 @@ void ns_account_identify(OutgoingWebRequest *request, OutgoingWebResponse *respo
 	}
 
 	// otherwise their pasword was correct or they used EXTERNAL
-	else
+	else if (success)
 	{
 		UnsetDropKey(client);
 		strlcpy(client->user->account, account, sizeof(client->user->account));
@@ -2290,6 +2260,14 @@ void ns_account_identify(OutgoingWebRequest *request, OutgoingWebResponse *respo
 		if (IsUser(client))
 			RunHook(HOOKTYPE_NOSERV_CONNECT_AND_LOGIN, client, result);
 
+	}
+	else if (bot)
+	{
+		if (HasCapability(client, "sasl"))
+				sendto_one(client, NULL, ":%s 904 %s :%s", me.name, "*", "Invalid login credentials");
+		if (bot)
+			special_send(bot, client, SR_FAIL, "LOGIN", "BAD_LOGIN", NULL, "Invalid login credentials");
+		add_fake_lag(client, 10000); // ten second penalty for bad logins
 	}
 	DelSaslType(client);
 	UnsetPassword(client);
@@ -3782,6 +3760,7 @@ CMD_FUNC(cmd_access)
 	char *json_serialized;
 	j = json_object();
 	
+	json_object_set_new(j, "channel", json_string_unreal(parv[1]));
 	json_object_set_new(j, "id", json_string_unreal(client->id));
 	json_object_set_new(j, "method", json_string_unreal("access")); // ID of the client
 	json_object_set_new(j, "type", json_string_unreal(type)); // see if that nick is registered
