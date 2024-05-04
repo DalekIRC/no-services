@@ -1394,7 +1394,11 @@ CMD_FUNC(cmd_register)
 		{
 			bot_sendnotice(bot, client, "Syntax: /msg %s REGISTER <account name> <email> <password>", bot->name);
 		}
-		sendto_one(client, NULL, ":%s FAIL REGISTER INVALID_PARAMS :Syntax: /REGISTER <account name> <email> <password>", me.name);
+		else
+		{
+			sendnumeric(client, ERR_NEEDMOREPARAMS, "REGISTER");
+		}
+		sendto_one(client, NULL, ":%s NOTE REGISTER INVALID_PARAMS :Syntax: /REGISTER <account name> <email> <password>", me.name);
 		return;
 	}
 
